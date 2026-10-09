@@ -807,6 +807,53 @@ export class SFTP extends EventEmitter {
   }
 
   /**
+   * Rename with POSIX semantics (`posix-rename@openssh.com`): an existing
+   * `newPath` is replaced atomically, where RENAME refuses it. Rejects without
+   * asking when the server does not advertise the extension.
+   */
+  posixRename(oldPath: string, newPath: string): Promise<void> {
+    this._checkClient();
+
+    const ext = 'posix-rename@openssh.com';
+    if (this._extensions[ext] !== '1') {
+      return Promise.reject(new Error(`server does not support ${ext}`));
+    }
+
+    const extBytes = fromString(ext);
+    const oldPathBytes = fromString(oldPath);
+    const newPathBytes = fromString(newPath);
+    const buf = allocBytes(
+      4 + 1 + 4 + 4 + extBytes.length + 4 + oldPathBytes.length + 4 + newPathBytes.length,
+    );
+    let p = 0;
+
+    writeUInt32BE(buf, buf.length - 4, p);
+    p += 4;
+    buf[p++] = REQUEST.EXTENDED;
+    const reqid = this._nextReqId();
+    writeUInt32BE(buf, reqid, p);
+    p += 4;
+
+    for (const bytes of [extBytes, oldPathBytes, newPathBytes]) {
+      writeUInt32BE(buf, bytes.length, p);
+      p += 4;
+      buf.set(bytes, p);
+      p += bytes.length;
+    }
+
+    return new Promise((resolve, reject) => {
+      this._requests[reqid] = {
+        cb: (err: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        },
+      };
+      this._sendOrBuffer(buf);
+      this._debug?.(`SFTP: Outbound: Sending ${ext}`);
+    });
+  }
+
+  /**
    * Create a directory
    */
   mkdir(path: string, attrs?: InputAttributes): Promise<void> {

@@ -198,7 +198,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: 'openssh sshd: sftp write, stat, readdir, read, rename, symlink, unlink',
+  name: 'openssh sshd: sftp write, stat, readdir, read, rename, posixRename, symlink, unlink',
   ignore,
   async fn() {
     const key = await generateKeyPair('ed25519');
@@ -214,6 +214,10 @@ Deno.test({
       assertEquals(st.size, 8);
 
       await sftp.rename(`${root}/a.txt`, `${root}/b.txt`);
+      // posix-rename replaces an existing target, which RENAME refuses
+      await sftp.writeFile(`${root}/c.txt`, new TextEncoder().encode('rowboat'));
+      await assertRejects(() => sftp.rename(`${root}/c.txt`, `${root}/b.txt`));
+      await sftp.posixRename(`${root}/c.txt`, `${root}/b.txt`);
       // An absolute target: with the arguments the wrong way round this fails
       // (b.txt exists) instead of creating a link in the sshd user's home
       await sftp.symlink(`${root}/b.txt`, `${root}/link`);
@@ -223,7 +227,7 @@ Deno.test({
       assertEquals(names, ['b.txt', 'link']);
 
       const data = await sftp.readFile(`${root}/b.txt`);
-      assertEquals(new TextDecoder().decode(data), 'sailboat');
+      assertEquals(new TextDecoder().decode(data), 'rowboat');
 
       await sftp.unlink(`${root}/link`);
       await sftp.unlink(`${root}/b.txt`);

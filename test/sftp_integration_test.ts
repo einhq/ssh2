@@ -1918,3 +1918,54 @@ Deno.test('SFTP server: a request with no listener answers OP_UNSUPPORTED instea
     assertEquals((err as { code?: number }).code, STATUS_CODE.OP_UNSUPPORTED);
   });
 });
+
+/** A client that has been sent VERSION v3 with these extensions; `sent` collects its packets. */
+async function makeVersionedSFTPClient(
+  extensions: Record<string, string>,
+): Promise<{ client: SFTP; sent: Uint8Array[] }> {
+  const sent: Uint8Array[] = [];
+  const protocol = {
+    channelData: (_id: number, data: Uint8Array) => sent.push(data.slice()),
+    channelClose: () => {},
+  };
+  const chanInfo = {
+    type: 'sftp',
+    incoming: { id: 0, window: 2 * 1024 * 1024, packetSize: 32768, state: 'open' },
+    outgoing: { id: 0, window: 2 * 1024 * 1024, packetSize: 32768, state: 'open' },
+  };
+  const client = new SFTP({ protocol }, chanInfo);
+  const ready = new Promise<void>((resolve) => client.once('ready', resolve));
+  client._init();
+  // VERSION's version field sits where rawPacket puts a request id
+  client.push(rawPacket(2, 3, ...Object.entries(extensions).flat()));
+  await ready;
+  sent.length = 0;
+  return { client, sent };
+}
+
+Deno.test('SFTP: posixRename sends posix-rename@openssh.com with both paths', async () => {
+  const { client, sent } = await makeVersionedSFTPClient({ 'posix-rename@openssh.com': '1' });
+
+  const done = client.posixRename('/a/old', '/a/new');
+  assertEquals(sent.length, 1);
+  const reqId = new DataView(sent[0].buffer).getUint32(5);
+  assertEquals(sent[0], rawPacket(200, reqId, 'posix-rename@openssh.com', '/a/old', '/a/new'));
+
+  // STATUS OK
+  const status = new Uint8Array(4 + 1 + 4 + 4);
+  new DataView(status.buffer).setUint32(0, 9);
+  status[4] = 101;
+  new DataView(status.buffer).setUint32(5, reqId);
+  client.push(status);
+  await done;
+});
+
+Deno.test('SFTP: posixRename rejects without asking when the server lacks the extension', async () => {
+  const { client, sent } = await makeVersionedSFTPClient({});
+  await assertRejects(
+    () => client.posixRename('/a/old', '/a/new'),
+    Error,
+    'posix-rename@openssh.com',
+  );
+  assertEquals(sent.length, 0);
+});
