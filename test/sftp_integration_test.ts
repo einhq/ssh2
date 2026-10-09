@@ -48,7 +48,9 @@ interface MockChannelInfo {
 /**
  * Create a mock SFTP client-server pair connected via in-memory pipes
  */
-function createSFTPPair(): { client: SFTP; server: SFTP; cleanup: () => void } {
+function createSFTPPair(
+  extensions?: Record<string, string>,
+): { client: SFTP; server: SFTP; cleanup: () => void } {
   const chanInfo: MockChannelInfo = {
     type: 'sftp',
     incoming: { id: 0, window: 2 * 1024 * 1024, packetSize: 32768, state: 'open' },
@@ -87,6 +89,7 @@ function createSFTPPair(): { client: SFTP; server: SFTP; cleanup: () => void } {
     { ...chanInfo },
     {
       server: true,
+      extensions,
       debug: DEBUG ? (msg: string) => console.log('[SERVER]', msg) : undefined,
     },
   );
@@ -109,8 +112,9 @@ function createSFTPPair(): { client: SFTP; server: SFTP; cleanup: () => void } {
 async function runSFTPTest(
   _name: string,
   testFn: (client: SFTP, server: SFTP) => Promise<void> | void,
+  extensions?: Record<string, string>,
 ): Promise<void> {
-  const { client, server, cleanup } = createSFTPPair();
+  const { client, server, cleanup } = createSFTPPair(extensions);
 
   try {
     // Wait for both sides to be ready
@@ -1968,4 +1972,20 @@ Deno.test('SFTP: posixRename rejects without asking when the server lacks the ex
     'posix-rename@openssh.com',
   );
   assertEquals(sent.length, 0);
+});
+
+Deno.test('SFTP server: advertised extensions reach the client, and posixRename arrives as EXTENDED', async () => {
+  await runSFTPTest('posix-rename', async (client, server) => {
+    assertEquals(client.extensions, {
+      'posix-rename@openssh.com': '1',
+      'hardlink@openssh.com': '1',
+    });
+
+    server.on('EXTENDED', (reqId: number, name: string, data: Uint8Array) => {
+      assertEquals(name, 'posix-rename@openssh.com');
+      assertEquals(data, rawPacket(0, 0, '/a/old', '/a/new').subarray(9));
+      server.status(reqId, STATUS_CODE.OK);
+    });
+    await client.posixRename('/a/old', '/a/new');
+  }, { 'posix-rename@openssh.com': '1', 'hardlink@openssh.com': '1' });
 });

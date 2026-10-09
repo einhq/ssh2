@@ -70,6 +70,11 @@ export interface SFTPConfig {
   debug?: (msg: string) => void;
   /** Use BigInt for 64-bit values */
   biOpt?: boolean;
+  /**
+   * Server mode: extensions advertised in VERSION, name to data (OpenSSH's
+   * `posix-rename@openssh.com` is `'1'`). Their requests arrive as `EXTENDED`.
+   */
+  extensions?: SFTPExtensions;
 }
 
 /**

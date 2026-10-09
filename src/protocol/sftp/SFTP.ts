@@ -189,6 +189,7 @@ export class SFTP extends EventEmitter {
     this._isOpenSSH = !!(remoteIdentRaw && RE_OPENSSH.test(remoteIdentRaw));
     this._isSsh2ts = !!(remoteIdentRaw && /^SSH-2\.0-ssh2ts/.test(remoteIdentRaw));
     this._biOpt = config.biOpt;
+    if (this.server) this._extensions = config.extensions ?? {};
 
     this._maxInPktLen = OPENSSH_MAX_PKT_LEN;
     this._maxOutPktLen = DEFAULT_MAX_PKT_LEN;
@@ -220,7 +221,7 @@ export class SFTP extends EventEmitter {
   }
 
   /**
-   * Get server extensions
+   * The extensions the server advertised; for a server, the ones it advertises
    */
   get extensions(): SFTPExtensions {
     return this._extensions;
@@ -1808,9 +1809,29 @@ export class SFTP extends EventEmitter {
     this._debug?.(`SFTP: Inbound: Received INIT (v${version})`);
 
     this._version = Math.min(version, 3); // We support up to version 3
-    this._sendOrBuffer(SERVER_VERSION_BUFFER);
+    this._sendOrBuffer(this._versionPacket());
     this.emit('ready');
     return true;
+  }
+
+  /** VERSION v3, followed by the advertised extensions */
+  private _versionPacket(): Uint8Array {
+    const pairs = Object.entries(this._extensions).flat().map(fromString);
+    if (!pairs.length) return SERVER_VERSION_BUFFER;
+
+    const buf = allocBytes(
+      SERVER_VERSION_BUFFER.length + pairs.reduce((n, b) => n + 4 + b.length, 0),
+    );
+    buf.set(SERVER_VERSION_BUFFER);
+    writeUInt32BE(buf, buf.length - 4, 0);
+    let p = SERVER_VERSION_BUFFER.length;
+    for (const bytes of pairs) {
+      writeUInt32BE(buf, bytes.length, p);
+      p += 4;
+      buf.set(bytes, p);
+      p += bytes.length;
+    }
+    return buf;
   }
 
   private _emitServerRequest(name: string, reqId: number, ...args: unknown[]): boolean {
