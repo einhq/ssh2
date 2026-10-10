@@ -1,6 +1,6 @@
 {
   "name": "@ein/ssh2-ts",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "exports": "./mod.ts",
   "description": "ssh2-ts - Fork of ssh2, ssh, sftp",
   "repository": "https://github.com/mattiasrunge/ssh2",
