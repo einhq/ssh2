@@ -11,6 +11,7 @@ import type { Channel } from '../src/Channel.ts';
 import { Client } from '../src/client.ts';
 import {
   type Connection,
+  type ConnectionInfo,
   KeyboardAuthContext,
   type PKAuthContext,
   Server,
@@ -971,11 +972,13 @@ Deno.test('server: constructor with connection listener argument', async () => {
   clearMustCallChecks();
   const hostKey = await generateTestHostKeyEd25519();
   let listenerCalled = false;
+  let info: ConnectionInfo | undefined;
 
   const server = new Server(
     { hostKeys: [hostKey.parsedKey] },
-    mustCall((conn: Connection, _info: { header: unknown }) => {
+    mustCall((conn: Connection, connInfo: ConnectionInfo) => {
       listenerCalled = true;
+      info = connInfo;
       conn.on('authentication', mustCall((authCtx: ServerAuthContext) => authCtx.accept()));
       conn.on('ready', mustCall(() => {}));
     }),
@@ -996,6 +999,8 @@ Deno.test('server: constructor with connection listener argument', async () => {
     await client.connect({ host: addr.hostname, port: addr.port, username: 'test', password: 't' });
     await done;
     assertEquals(listenerCalled, true);
+    assertEquals(info?.ip, '127.0.0.1');
+    assertEquals(typeof info?.port, 'number');
   } finally {
     try {
       client.end();

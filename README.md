@@ -586,8 +586,8 @@ import { Client, generateKeyPair, parseKey, Server } from 'jsr:@ein/ssh2-ts';
 
 #### Server events
 
-- **connection**(client: Connection, info: object) - A new client has connected. `info` contains
-  `ip`, `port`, `family`, and `header` properties.
+- **connection**(client: Connection, info: ConnectionInfo) - A new client has connected. `info`
+  contains the client's `header`, and its `ip` and `port` when the transport knows them.
 
 #### Server methods
 

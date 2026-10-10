@@ -1273,7 +1273,9 @@ export class Connection extends EventEmitter<ConnectionEvents> {
         transport.close();
       },
       onHeader: (header) => {
-        const info = {
+        const info: ConnectionInfo = {
+          ip: transport.remoteAddress,
+          port: transport.remotePort,
           header,
         };
         if (!server.emit('connection', this, info)) {
@@ -1547,10 +1549,22 @@ export interface ServerConfig {
 }
 
 /**
+ * What a server knows about a client when it connects
+ */
+export interface ConnectionInfo {
+  /** Client address, when the transport has one */
+  ip?: string;
+  /** Client port, when the transport has one */
+  port?: number;
+  /** The client's identification header */
+  header: unknown;
+}
+
+/**
  * Server events
  */
 export interface ServerEvents {
-  connection: [client: Connection, info: { header: unknown }];
+  connection: [client: Connection, info: ConnectionInfo];
   error: [Error];
   listening: [];
   close: [];
