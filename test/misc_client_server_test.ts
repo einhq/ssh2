@@ -521,6 +521,53 @@ Deno.test({
   },
 });
 
+/** Records what a server connection emits from now until it closes. */
+function connectionEvents(conn: Connection): Promise<string[]> {
+  const events: string[] = [];
+  return new Promise((resolve) => {
+    conn.on('end', () => events.push('end'));
+    conn.on('error', (err: Error) => events.push(`error: ${err.message}`));
+    conn.on('close', () => {
+      events.push('close');
+      resolve(events);
+    });
+  });
+}
+
+Deno.test({
+  name: 'misc: A client that disconnects ends the server connection without an error',
+  fn: async () => {
+    clearMustCallChecks();
+    const ctx = await createTestContext('Client disconnects');
+
+    try {
+      const conn = await connectWithPasswordAuth(ctx, 'Client disconnects');
+      const events = connectionEvents(conn);
+      ctx.client.end();
+      assertEquals(await events, ['end', 'close']);
+    } finally {
+      await ctx.cleanup();
+    }
+  },
+});
+
+Deno.test({
+  name: 'misc: A server that ends the connection reports no error',
+  fn: async () => {
+    clearMustCallChecks();
+    const ctx = await createTestContext('Server ends');
+
+    try {
+      const conn = await connectWithPasswordAuth(ctx, 'Server ends');
+      const events = connectionEvents(conn);
+      conn.end();
+      assertEquals(await events, ['end', 'close']);
+    } finally {
+      await ctx.cleanup();
+    }
+  },
+});
+
 Deno.test({
   name: 'misc: Simple rekey test',
   ignore: false,

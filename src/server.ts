@@ -1315,6 +1315,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
    * Write data to transport (queued for sequential writes)
    */
   private _writeToTransport(data: Uint8Array): void {
+    if (this._transport.closed) return;
     this._writeQueue.push(data);
     this._processWriteQueue();
   }
@@ -1342,7 +1343,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
     } catch (err) {
       // Clear the queue to prevent infinite recursion when transport is closed
       this._writeQueue.length = 0;
-      this.emit('error', err as Error);
+      // A write cut short by closing the transport is the end of the connection
+      if (!this._transport.closed) this.emit('error', err as Error);
     } finally {
       // Always release the writer lock, even on error
       writer?.releaseLock();
@@ -1380,9 +1382,16 @@ export class Connection extends EventEmitter<ConnectionEvents> {
       }
       reader.releaseLock();
     } catch (err) {
-      const error = err as Error & { level?: string };
-      error.level = 'socket';
-      this.emit('error', error);
+      if (this._transport.closed) {
+        // This side closed the transport (a DISCONNECT, end()), which fails the
+        // next read: the connection has ended, not failed
+        this._debug?.('Transport closed');
+        this.emit('end');
+      } else {
+        const error = err as Error & { level?: string };
+        error.level = 'socket';
+        this.emit('error', error);
+      }
     } finally {
       this._protocol.cleanup();
       this.emit('close');
