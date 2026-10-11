@@ -167,6 +167,8 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
   private _remoteIdentRaw: Uint8Array | undefined;
   _authsQueue: string[] = [];
   _compatFlags = 0;
+  // Packets held back from our KEXINIT until our NEWKEYS is out and the new
+  // outbound cipher is in place
   private _queue: OutboundPayload[] | undefined;
   private _banner: string | undefined;
   private _hostKeys: HostKeyInfo[] | undefined;
@@ -675,16 +677,6 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
     // Key exchange is complete
     this._kexinit = undefined;
 
-    // Flush any queued packets (from during rekey)
-    if (this._queue) {
-      const queue = this._queue;
-      this._queue = undefined;
-      this._debug?.(`Flushing ${queue.length} queued packets after rekey`);
-      for (const payload of queue) {
-        this._sendPacket(payload);
-      }
-    }
-
     // Notify handshake complete
     this._onHandshakeComplete?.(this._kexHandler.state.algorithms);
   }
@@ -812,6 +804,8 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
       this._extInfoSent = true;
       this.sendExtInfo([{ name: 'server-sig-algs', value: SUPPORTED_SERVER_HOST_KEY.join(',') }]);
     }
+
+    this._flushQueue();
 
     this._debug?.('Server key exchange complete, waiting for client NEWKEYS');
   }
@@ -956,6 +950,8 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
 
     // Switch cipher for sending (client to server)
     this._switchOutboundCipher();
+
+    this._flushQueue();
 
     this._debug?.('Client key exchange complete, waiting for server NEWKEYS');
   }
@@ -1475,6 +1471,8 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
     this._debug?.('Outbound: Sending NEWKEYS');
     // Force send - key exchange packets must never be queued during rekey
     this._sendPacket(payload, true);
+    // Packets still being compressed or encrypted under the old keys reach the
+    // transport before the outbound cipher changes
     await this._waitForOutboundPackets();
   }
 
@@ -1621,7 +1619,26 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
     this._kexinit = kexinit;
 
     this._debug?.('Outbound: Sending KEXINIT');
-    this._sendPacket(kexinit);
+    this._sendPacket(kexinit, true);
+
+    // RFC 4253 7.1: no service messages from KEXINIT until our NEWKEYS. Every
+    // non-forced packet waits for the new keys, since one produced while
+    // NEWKEYS is out but the old cipher still in place would be encrypted under
+    // keys the peer has already dropped.
+    this._queue ??= [];
+  }
+
+  /**
+   * Send the packets held back during the key exchange, under the new keys
+   */
+  private _flushQueue(): void {
+    const queue = this._queue;
+    if (!queue) return;
+    this._queue = undefined;
+    this._debug?.(`Flushing ${queue.length} queued packets after key exchange`);
+    for (const payload of queue) {
+      this._sendPacket(payload);
+    }
   }
 
   /**
@@ -1760,10 +1777,7 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
   rekey(): void {
     if (this._kexinit === undefined) {
       this._debug?.('Outbound: Initiated explicit rekey');
-      // Send KEXINIT first, then start queuing
-      // (can't set queue before send or KEXINIT gets queued too)
       this._sendKexInit();
-      this._queue = [];
     } else {
       this._debug?.('Outbound: Ignoring rekey during handshake');
     }
