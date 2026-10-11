@@ -5,7 +5,6 @@
 
 export * from './aes-cbc.ts';
 export * from './chacha20.ts';
-export * from './poly1305.ts';
 export * from './ciphers.ts';
 export * from './hash.ts';
 export * from './kex.ts';

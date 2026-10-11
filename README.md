@@ -815,9 +815,10 @@ Almost all cryptography runs on Deno's built-in
 
 The two features Web Crypto does not cover are provided without any third-party dependency:
 
-- **`chacha20-poly1305@openssh.com`** transport cipher — uses the runtime's native `chacha20` cipher
-  from `node:crypto` (available in Deno 2.9.4+) together with a vendored Poly1305 implementation
-  (`src/crypto/poly1305.ts`).
+- **`chacha20-poly1305@openssh.com`** transport cipher — ChaCha20 and Poly1305 in WebAssembly
+  (`src/crypto/chachapoly.wat`, assembled into `src/crypto/chachapoly-wasm.ts` by
+  `deno task build:wasm`), with payloads of 2 KiB and more encrypted by the runtime's native
+  `chacha20` cipher from `node:crypto` (available in Deno 2.9.4+).
 - **`bcrypt` KDF** — used when reading or writing passphrase-protected OpenSSH private keys
   (`src/keygen.ts`, `src/protocol/keyParser.ts`); provided by a vendored `bcrypt_pbkdf`
   implementation (`src/crypto/bcrypt-pbkdf.ts`).

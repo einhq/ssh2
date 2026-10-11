@@ -5,40 +5,107 @@
  * standard AEAD ChaCha20-Poly1305 (RFC 8439): the original DJB ChaCha20 variant
  * (8-byte nonce, explicit block counter) plus a detached Poly1305 MAC.
  *
- * ChaCha20 uses the runtime's native node:crypto cipher (requires a Deno
- * version whose node:crypto supports the raw "chacha20" cipher); Poly1305 is
- * vendored in poly1305.ts since no runtime exposes it standalone.
+ * Poly1305, the length and Poly1305-key blocks, and small payloads run in
+ * WebAssembly (chachapoly.wat), one instance per direction, with the packet
+ * assembled in its memory. Payloads from NATIVE_MIN bytes on use the runtime's
+ * native node:crypto ChaCha20 (requires a Deno version whose node:crypto
+ * supports the raw "chacha20" cipher), which is faster once its per-call setup
+ * is paid off.
  */
 
 import { createCipheriv } from 'node:crypto';
-import { allocBytes, readUInt32BE, writeUInt32BE } from '../utils/binary.ts';
+import { readUInt32BE, writeUInt32BE } from '../utils/binary.ts';
 import type { Cipher, CipherConfig, Decipher, DecipherConfig } from './ciphers.ts';
-import { poly1305 } from './poly1305.ts';
+import { CHACHAPOLY_WASM } from './chachapoly-wasm.ts';
 import { randomFill } from './random.ts';
 import { timingSafeEqual } from './utils.ts';
 
 const MAX_PACKET_SIZE = 35000;
 
+/** Payload size from which the native ChaCha20 beats the WebAssembly one. */
+const NATIVE_MIN = 2048;
+
+// Layout of an instance's memory. Bytes 0-63 are the module's own scratch.
+const KEY_MAIN = 64; // 32-byte payload key
+const KEY_LEN = 96; // 32-byte packet-length key
+const NONCE = 128; // 8 bytes: the sequence number, big-endian
+const LEN = 136; // 4 bytes: the decrypted packet length
+const POLY_KEY = 144; // 32 bytes
+const TAG = 176; // 16 bytes: the received MAC
+const EXPECTED_TAG = 192; // 16 bytes
+const PACKET = 208; // encrypted length, then the packet, then (outbound) its MAC
+
+const PAGE = 65536;
+const MODULE = new WebAssembly.Module(CHACHAPOLY_WASM as BufferSource);
+
+interface ChaChaPolyExports {
+  memory: WebAssembly.Memory;
+  chacha20(key: number, nonce: number, counter: number, data: number, len: number): void;
+  poly1305(key: number, msg: number, len: number, out: number): void;
+}
+
 /**
- * DJB-variant ChaCha20 (8-byte nonce, 64-bit counter) as used by OpenSSH.
- *
- * The native cipher uses the OpenSSL IV layout: 32-bit little-endian counter
- * followed by a 96-bit nonce. A DJB counter below 2^32 maps onto it as
- * counter(4 LE) || 0x00000000 || nonce(8) — SSH only uses counters 0 and 1.
+ * One direction's ChaCha20-Poly1305 state: a WebAssembly instance holding the
+ * 64-byte SSH key (payload key, then length key) and the packet being sealed
+ * or opened.
  */
-export function chacha20(
-  key: Uint8Array,
-  nonce: Uint8Array,
-  data: Uint8Array,
-  counter: number = 0,
-): Uint8Array {
-  const iv = new Uint8Array(16);
-  iv[0] = counter & 0xff;
-  iv[1] = (counter >>> 8) & 0xff;
-  iv[2] = (counter >>> 16) & 0xff;
-  iv[3] = (counter >>> 24) & 0xff;
-  iv.set(nonce, 8);
-  return new Uint8Array(createCipheriv('chacha20', key, iv).update(data));
+class ChaChaPoly {
+  readonly wasm: ChaChaPolyExports;
+  mem: Uint8Array;
+  private _keyMain: Uint8Array;
+  private _iv = new Uint8Array(16);
+
+  constructor(key: Uint8Array) {
+    this.wasm = new WebAssembly.Instance(MODULE).exports as unknown as ChaChaPolyExports;
+    this.mem = new Uint8Array(this.wasm.memory.buffer);
+    this._keyMain = key.slice(0, 32);
+    this.mem.set(key.subarray(0, 64), KEY_MAIN);
+    // Payloads start at block 1.
+    this._iv[0] = 1;
+  }
+
+  /** Grows memory so that PACKET + size bytes fit. */
+  reserve(size: number): void {
+    const need = PACKET + size - this.mem.length;
+    if (need > 0) {
+      this.wasm.memory.grow(Math.ceil(need / PAGE));
+      this.mem = new Uint8Array(this.wasm.memory.buffer);
+    }
+  }
+
+  /** Sets the nonce for seqno and derives the packet's Poly1305 key. */
+  begin(seqno: number): void {
+    writeUInt32BE(this.mem, seqno, NONCE + 4);
+    this.mem.fill(0, POLY_KEY, POLY_KEY + 32);
+    this.wasm.chacha20(KEY_MAIN, NONCE, 0, POLY_KEY, 32);
+  }
+
+  /** XORs the 4 bytes at offset with the length keystream. */
+  length(offset: number): void {
+    this.wasm.chacha20(KEY_LEN, NONCE, 0, offset, 4);
+  }
+
+  /** Encrypts or decrypts len payload bytes at PACKET + 4 in place. */
+  payload(len: number): void {
+    const start = PACKET + 4;
+    if (len < NATIVE_MIN) {
+      this.wasm.chacha20(KEY_MAIN, NONCE, 1, start, len);
+      return;
+    }
+    this._iv.set(this.mem.subarray(NONCE, NONCE + 8), 8);
+    // The native counter is 32-bit little-endian, then a 96-bit nonce:
+    // counter(4) || 0x00000000 || nonce(8) is the DJB counter-and-nonce block.
+    const cipher = createCipheriv('chacha20', this._keyMain, this._iv);
+    this.mem.set(cipher.update(this.mem.subarray(start, start + len)), start);
+    // Deno keeps the native cipher context in its resource table until final(),
+    // so a stream cipher is finalized although it has nothing left to emit.
+    cipher.final();
+  }
+
+  /** Writes the Poly1305 tag of the len bytes at PACKET to out. */
+  mac(len: number, out: number): void {
+    this.wasm.poly1305(POLY_KEY, PACKET, len, out);
+  }
 }
 
 /**
@@ -52,19 +119,14 @@ export function chacha20(
 export class ChaChaPolyCipher implements Cipher {
   outSeqno: number;
   private _onWrite: (data: Uint8Array) => void;
-  private _encKeyMain: Uint8Array;
-  private _encKeyPktLen: Uint8Array;
+  private _state: ChaChaPoly;
   private _dead = false;
 
   constructor(config: CipherConfig) {
     const enc = config.outbound;
     this.outSeqno = enc.seqno;
     this._onWrite = enc.onWrite;
-    // SSH chacha20-poly1305 uses 64 bytes key per OpenSSH cipher-chachapoly.c:
-    // main_ctx = key[0:32] - for payload encryption
-    // header_ctx = key[32:64] - for length encryption
-    this._encKeyMain = enc.cipherKey.subarray(0, 32);
-    this._encKeyPktLen = enc.cipherKey.subarray(32, 64);
+    this._state = new ChaChaPoly(enc.cipherKey);
   }
 
   free(): void {
@@ -77,7 +139,7 @@ export class ChaChaPolyCipher implements Cipher {
     if (padLen < 4) padLen += 8;
     pktLen += padLen;
 
-    const packet = allocBytes(pktLen);
+    const packet = new Uint8Array(pktLen);
     writeUInt32BE(packet, pktLen - 4, 0);
     packet[4] = padLen;
     randomFill(packet, 5 + payloadLen, padLen);
@@ -88,32 +150,15 @@ export class ChaChaPolyCipher implements Cipher {
   encrypt(packet: Uint8Array): void {
     if (this._dead) return;
 
-    // Build 8-byte nonce: 64-bit sequence number in big-endian (DJB format)
-    const nonce = allocBytes(8);
-    // seqno is 32-bit, so upper 4 bytes are 0
-    writeUInt32BE(nonce, this.outSeqno, 4);
-
-    // Generate Poly1305 key using ChaCha20 with counter=0
-    const polyKeyNonce = new Uint8Array(nonce);
-    const zeros32 = allocBytes(32);
-    const polyKey = chacha20(this._encKeyMain, polyKeyNonce, zeros32);
-
-    // Encrypt packet length (4 bytes) with length key
-    const lenBytes = packet.subarray(0, 4);
-    const encryptedLen = chacha20(this._encKeyPktLen, nonce, lenBytes);
-    // Encrypt payload with main key, counter=1
-    // ChaCha20 counter starts at 1 for payload encryption
-    const payload = packet.subarray(4);
-    const encryptedPayload = chacha20(this._encKeyMain, nonce, payload, 1);
-    // Calculate Poly1305 MAC over encrypted length + encrypted payload
-    // Note: poly1305 takes (message, key) not (key, message)
-    const macOffset = encryptedLen.length + encryptedPayload.length;
-    const record = allocBytes(macOffset + 16);
-    record.set(encryptedLen, 0);
-    record.set(encryptedPayload, encryptedLen.length);
-    const mac = poly1305(record.subarray(0, macOffset), polyKey);
-    record.set(mac, macOffset);
-    this._onWrite(record);
+    const state = this._state;
+    const len = packet.length;
+    state.reserve(len + 16);
+    state.mem.set(packet, PACKET);
+    state.begin(this.outSeqno);
+    state.length(PACKET);
+    state.payload(len - 4);
+    state.mac(len, PACKET + len);
+    this._onWrite(state.mem.slice(PACKET, PACKET + len + 16));
 
     this.outSeqno = (this.outSeqno + 1) >>> 0;
   }
@@ -126,31 +171,27 @@ type PayloadCallback = (
 
 /**
  * ChaCha20-Poly1305 Decipher for SSH
+ *
+ * A packet's bytes are gathered at PACKET in the instance's memory as they
+ * arrive: the encrypted length, the encrypted packet, then the MAC at TAG.
  */
 export class ChaChaPolyDecipher implements Decipher {
   inSeqno: number;
   private _onPayload: PayloadCallback;
-  private _decKeyMain: Uint8Array;
-  private _decKeyPktLen: Uint8Array;
+  private _state: ChaChaPoly;
 
   // State for incremental decryption
   private _len = 0;
-  private _lenBuf = allocBytes(4);
   private _lenPos = 0;
-  private _packet: Uint8Array | null = null;
   private _pktLen = 0;
-  private _mac = allocBytes(16);
   private _macPos = 0;
 
   constructor(config: DecipherConfig) {
     const dec = config.inbound;
     this.inSeqno = dec.seqno;
     this._onPayload = dec.onPayload;
-    // SSH chacha20-poly1305 uses 64 bytes key per OpenSSH cipher-chachapoly.c:
-    // main_ctx = key[0:32] - for payload encryption
-    // header_ctx = key[32:64] - for length encryption
-    this._decKeyMain = dec.decipherKey.subarray(0, 32);
-    this._decKeyPktLen = dec.decipherKey.subarray(32, 64);
+    this._state = new ChaChaPoly(dec.decipherKey);
+    this._state.reserve(4 + MAX_PACKET_SIZE);
   }
 
   free(): void {}
@@ -160,23 +201,22 @@ export class ChaChaPolyDecipher implements Decipher {
     p: number,
     dataLen: number,
   ): Promise<void | boolean | number> {
+    const state = this._state;
+    const mem = state.mem;
     while (p < dataLen) {
       // Read encrypted packet length (4 bytes)
       if (this._lenPos < 4) {
         const nb = Math.min(4 - this._lenPos, dataLen - p);
-        for (let i = 0; i < nb; i++) {
-          this._lenBuf[this._lenPos++] = data[p++];
-        }
+        mem.set(data.subarray(p, p + nb), PACKET + this._lenPos);
+        p += nb;
+        this._lenPos += nb;
         if (this._lenPos < 4) return;
 
-        // Build 8-byte nonce: 64-bit sequence number in big-endian (DJB format)
-        const nonce = allocBytes(8);
-        // seqno is 32-bit, so upper 4 bytes are 0
-        writeUInt32BE(nonce, this.inSeqno, 4);
-
-        // Decrypt length
-        const decryptedLen = chacha20(this._decKeyPktLen, nonce, this._lenBuf);
-        this._len = readUInt32BE(decryptedLen, 0);
+        // The MAC covers the encrypted length, so decrypt a copy.
+        state.begin(this.inSeqno);
+        mem.copyWithin(LEN, PACKET, PACKET + 4);
+        state.length(LEN);
+        this._len = readUInt32BE(mem, LEN);
 
         if (this._len > MAX_PACKET_SIZE || this._len < 8 || (this._len & 7) !== 0) {
           throw new Error('Bad packet length');
@@ -187,15 +227,7 @@ export class ChaChaPolyDecipher implements Decipher {
       if (this._pktLen < this._len) {
         if (p >= dataLen) return;
         const nb = Math.min(this._len - this._pktLen, dataLen - p);
-        const chunk = data.subarray(p, p + nb);
-        if (nb === this._len) {
-          this._packet = new Uint8Array(chunk);
-        } else {
-          if (!this._packet) {
-            this._packet = allocBytes(this._len);
-          }
-          this._packet.set(chunk, this._pktLen);
-        }
+        mem.set(data.subarray(p, p + nb), PACKET + 4 + this._pktLen);
         p += nb;
         this._pktLen += nb;
         if (this._pktLen < this._len || p >= dataLen) return;
@@ -204,46 +236,35 @@ export class ChaChaPolyDecipher implements Decipher {
       // Read Poly1305 MAC (16 bytes)
       {
         const nb = Math.min(16 - this._macPos, dataLen - p);
-        for (let i = 0; i < nb; i++) {
-          this._mac[this._macPos++] = data[p++];
-        }
+        mem.set(data.subarray(p, p + nb), TAG + this._macPos);
+        p += nb;
+        this._macPos += nb;
         if (this._macPos < 16) return;
       }
 
-      // Build 8-byte nonce: 64-bit sequence number in big-endian (DJB format)
-      const nonce = allocBytes(8);
-      // seqno is 32-bit, so upper 4 bytes are 0
-      writeUInt32BE(nonce, this.inSeqno, 4);
-
-      // Generate Poly1305 key
-      const zeros32 = allocBytes(32);
-      const polyKey = chacha20(this._decKeyMain, nonce, zeros32);
-
-      // Verify MAC
-      // Note: poly1305 takes (message, key) not (key, message)
-      const macData = allocBytes(4 + this._packet!.length);
-      macData.set(this._lenBuf, 0);
-      macData.set(this._packet!, 4);
-      const expectedMac = poly1305(macData, polyKey);
-
-      if (!timingSafeEqual(expectedMac, this._mac)) {
+      const len = this._len;
+      state.mac(4 + len, EXPECTED_TAG);
+      if (
+        !timingSafeEqual(
+          mem.subarray(EXPECTED_TAG, EXPECTED_TAG + 16),
+          mem.subarray(TAG, TAG + 16),
+        )
+      ) {
         throw new Error('Invalid MAC');
       }
 
-      // Decrypt payload with counter=1
-      const decryptedPayload = chacha20(this._decKeyMain, nonce, this._packet!, 1);
+      state.payload(len);
 
-      const padLen = decryptedPayload[0];
-      if (padLen > decryptedPayload.length - 1) {
+      const padLen = mem[PACKET + 4];
+      if (padLen > len - 1) {
         throw new Error('Invalid padding length');
       }
-      const payload = decryptedPayload.subarray(1, decryptedPayload.length - padLen);
+      const payload = mem.slice(PACKET + 5, PACKET + 4 + len - padLen);
 
       // Prepare for next packet
       this.inSeqno = (this.inSeqno + 1) >>> 0;
       this._len = 0;
       this._lenPos = 0;
-      this._packet = null;
       this._pktLen = 0;
       this._macPos = 0;
 
