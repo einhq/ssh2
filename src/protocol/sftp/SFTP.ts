@@ -505,7 +505,7 @@ export class SFTP extends EventEmitter {
    *
    * Writes all `length` bytes, splitting into multiple WRITE packets when the
    * payload exceeds the negotiated max packet size. Resolves once every chunk
-   * has been acknowledged.
+   * has been acknowledged. A zero `length` sends nothing.
    */
   write(
     handle: SFTPHandle,
@@ -517,7 +517,7 @@ export class SFTP extends EventEmitter {
     this._checkClient();
     this._checkHandle(handle);
 
-    if (offset >= buffer.length) throw new Error('offset out of bounds');
+    if (offset > buffer.length) throw new Error('offset out of bounds');
     if (offset + length > buffer.length) throw new Error('length extends past buffer');
 
     return this._writeAll(handle, buffer, offset, length, position);

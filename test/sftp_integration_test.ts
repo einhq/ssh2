@@ -785,6 +785,34 @@ Deno.test('SFTP: appendFile', async () => {
   });
 });
 
+for (const method of ['writeFile', 'appendFile'] as const) {
+  Deno.test(`SFTP: ${method} of empty data opens and closes without a WRITE`, async () => {
+    await runSFTPTest(`${method} empty`, async (client, server) => {
+      const handle = new Uint8Array([1, 2, 3, 4]);
+      let writes = 0;
+      let closed = false;
+
+      server.on('OPEN', (id: number) => {
+        server.handle(id, handle);
+      });
+
+      server.on('WRITE', (id: number) => {
+        writes++;
+        server.status(id, STATUS_CODE.OK);
+      });
+
+      server.on('CLOSE', (id: number) => {
+        closed = true;
+        server.status(id, STATUS_CODE.OK);
+      });
+
+      await client[method]('/test/empty.txt', new Uint8Array());
+      assertEquals(writes, 0);
+      assertEquals(closed, true);
+    });
+  });
+}
+
 Deno.test('SFTP: unlink', async () => {
   await runSFTPTest('unlink', async (client, server) => {
     const path = '/foo/bar/file.txt';
@@ -1301,12 +1329,12 @@ Deno.test('SFTP: read() throws when offset+length exceeds buffer', async () => {
   });
 });
 
-Deno.test('SFTP: write() throws when offset >= buffer.length', async () => {
+Deno.test('SFTP: write() throws when offset > buffer.length', async () => {
   await runSFTPTest('write bounds', async (client, _server) => {
     const handle = new Uint8Array([0x01]);
     const buf = new Uint8Array(10);
     assertThrows(
-      () => client.write(handle, buf, 10, 1, 0),
+      () => client.write(handle, buf, 11, 0, 0),
       Error,
       'offset out of bounds',
     );
