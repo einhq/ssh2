@@ -5,7 +5,13 @@
  * Supports both client and server modes.
  */
 
-import { allocBytes, concatBytes, fromString, writeUInt32BE } from '../../utils/binary.ts';
+import {
+  allocBytes,
+  concatBytes,
+  fromString,
+  readUInt32BE,
+  writeUInt32BE,
+} from '../../utils/binary.ts';
 import { EventEmitter } from '../../utils/events.ts';
 import { onWindowAdjust } from '../../channel-window.ts';
 import {
@@ -152,6 +158,12 @@ export class SFTP extends EventEmitter {
   private _pktLen = 0;
   private _pktPos = 0;
   private _pkt?: Uint8Array;
+  /**
+   * A WRITE being assembled from several pushes keeps its data here, in a
+   * buffer it fills, and the rest of the packet, up to `_dataAt`, in `_pkt`.
+   */
+  private _writeData?: Uint8Array;
+  private _dataAt = 0;
 
   // Request tracking
   private _writeReqid = -1;
@@ -240,7 +252,9 @@ export class SFTP extends EventEmitter {
    * Handle incoming data: the payloads of the channel's packets, in order. A
    * request is handed on as a view of the data it arrived in, or, when it spans
    * several pushes, of a buffer of its own, so the data pushed must not be
-   * reused: a WRITE's data belongs to its listener.
+   * reused: a WRITE's data belongs to its listener. A WRITE that spans pushes
+   * has its data assembled apart, in a buffer it fills, which is the
+   * listener's too.
    */
   push(data: Uint8Array | null): void {
     if (data === null) {
@@ -284,10 +298,8 @@ export class SFTP extends EventEmitter {
           this._pkt = data.subarray(p, p + nb);
         } else {
           // Fragmented packet
-          if (!this._pkt) {
-            this._pkt = new Uint8Array(this._pktLen);
-          }
-          this._pkt.set(data.subarray(p, p + nb), this._pktPos);
+          if (!this._pkt) this._startAssembly(data.subarray(p, p + nb));
+          this._assemble(data.subarray(p, p + nb));
         }
 
         p += nb;
@@ -299,12 +311,15 @@ export class SFTP extends EventEmitter {
       // Process complete packet
       const type = this._pkt![0];
       const payload = this._pkt!;
+      const writeData = this._writeData;
 
       // Reset for next packet
       this._pktLen = 0;
       this._pktLenBytes = 0;
       this._pkt = undefined;
       this._pktPos = 0;
+      this._writeData = undefined;
+      this._dataAt = 0;
 
       // Handle packet
       if (this._version === -1) {
@@ -319,12 +334,47 @@ export class SFTP extends EventEmitter {
         }
       }
 
-      if (this.server) {
+      if (writeData) {
+        if (!this._handleWrite(payload, writeData)) return;
+      } else if (this.server) {
         if (!this._handleServerPacket(type, payload)) return;
       } else {
         if (!this._handleClientPacket(type, payload)) return;
       }
     }
+  }
+
+  /**
+   * Starts assembling a packet from its first part. A WRITE to a server whose
+   * fields before the data are all in that part keeps its data apart.
+   */
+  private _startAssembly(first: Uint8Array): void {
+    const len = this._pktLen;
+    if (this.server && this._version !== -1 && first[0] === REQUEST.WRITE && first.length >= 9) {
+      // type, id, handle, offset, data length
+      const dataAt = 9 + readUInt32BE(first, 5) + 8 + 4;
+      if (
+        dataAt < len && dataAt <= first.length && readUInt32BE(first, dataAt - 4) === len - dataAt
+      ) {
+        this._pkt = new Uint8Array(dataAt);
+        this._writeData = new Uint8Array(len - dataAt);
+        this._dataAt = dataAt;
+        return;
+      }
+    }
+    this._pkt = new Uint8Array(len);
+  }
+
+  /** Copies the packet's next bytes to where they belong. */
+  private _assemble(part: Uint8Array): void {
+    const at = this._pktPos;
+    if (!this._writeData) {
+      this._pkt!.set(part, at);
+      return;
+    }
+    const head = Math.max(0, Math.min(part.length, this._dataAt - at));
+    if (head > 0) this._pkt!.set(part.subarray(0, head), at);
+    if (head < part.length) this._writeData.set(part.subarray(head), at + head - this._dataAt);
   }
 
   /**
@@ -1897,13 +1947,23 @@ export class SFTP extends EventEmitter {
     return this._emitServerRequest('READ', reqId!, handle, offset, length);
   }
 
-  /** The data is the listener's to keep without a copy; nothing here reuses it. */
-  private _handleWrite(payload: Uint8Array): boolean {
+  /**
+   * The data is the listener's to keep without a copy; nothing here reuses it.
+   * Data assembled apart (`apart`, push()) fills its buffer, which is the
+   * listener's too.
+   */
+  private _handleWrite(payload: Uint8Array, apart?: Uint8Array): boolean {
     this._parser.init(payload, 1);
     const reqId = this._parser.readUInt32BE();
     const handle = this._parser.readString(false) as Uint8Array | undefined;
     const offset = this._parser.readUInt64BE(this._biOpt);
-    const data = this._parser.readString(false) as Uint8Array | undefined;
+    let data: Uint8Array | undefined;
+    if (apart) {
+      // The length, which push() checked against the data's.
+      if (this._parser.readUInt32BE() !== undefined) data = apart;
+    } else {
+      data = this._parser.readString(false) as Uint8Array | undefined;
+    }
     this._parser.clear();
 
     if (data === undefined) {

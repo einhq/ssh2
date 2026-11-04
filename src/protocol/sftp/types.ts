@@ -245,7 +245,10 @@ export interface WriteRequest {
   reqId: number;
   handle: SFTPHandle;
   offset: number | bigint;
-  /** The listener's to keep: ssh2-ts never reuses it. */
+  /**
+   * The listener's to keep: ssh2-ts never reuses it. When it fills its
+   * ArrayBuffer, the buffer holds nothing else and is the listener's too.
+   */
   data: Uint8Array;
 }
 

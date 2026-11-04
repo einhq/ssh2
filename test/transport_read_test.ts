@@ -168,7 +168,7 @@ Deno.test({
 
 for (const cipher of ['chacha20-poly1305@openssh.com', 'aes128-gcm@openssh.com', 'aes128-ctr']) {
   Deno.test({
-    name: `an SFTP WRITE's data is the listener's to keep (${cipher})`,
+    name: `an SFTP WRITE's data is the listener's to keep, and a buffer it fills (${cipher})`,
     sanitizeResources: false,
     sanitizeOps: false,
     async fn() {
@@ -193,6 +193,7 @@ for (const cipher of ['chacha20-poly1305@openssh.com', 'aes128-gcm@openssh.com',
         algorithms: { cipher: [cipher] },
       });
       const kept: [bigint, Uint8Array][] = [];
+      let transferred = 0;
       server.on('connection', (conn: Connection) => {
         conn.on('authentication', (ctx: ServerAuthContext) => ctx.accept());
         conn.on('error', () => {});
@@ -212,6 +213,12 @@ for (const cipher of ['chacha20-poly1305@openssh.com', 'aes128-gcm@openssh.com',
             sftp.on(
               'WRITE',
               (id: number, _handle: SFTPHandle, offset: number | bigint, data: Uint8Array) => {
+                // A buffer the data fills holds nothing else: taking it away leaves
+                // every other WRITE's data as it was.
+                if (data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) {
+                  data = structuredClone(data, { transfer: [data.buffer as ArrayBuffer] });
+                  transferred++;
+                }
                 kept.push([BigInt(offset), data]);
                 sftp.status(id, STATUS_CODE.OK);
               },
@@ -246,6 +253,8 @@ for (const cipher of ['chacha20-poly1305@openssh.com', 'aes128-gcm@openssh.com',
       for (const [offset, data] of kept) got.set(data, Number(offset));
       assertEquals(kept.length, pieces.length);
       assertEquals(got, upload);
+      // This client puts most writes in a channel packet each; a few span two.
+      assert(transferred > 0, 'no WRITE spanned channel packets');
       client.end();
       server.close();
     },

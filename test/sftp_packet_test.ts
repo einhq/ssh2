@@ -2,7 +2,7 @@
  * SFTP Packet Tests
  *
  * Unit tests for PacketParser, attrsToBytes, toUnixTimestamp, modeNum, writeString
- * in src/protocol/sftp/packet.ts.
+ * in src/protocol/sftp/packet.ts, and how SFTP.push assembles a WRITE.
  */
 
 import { assertEquals, assertThrows } from '@std/assert';
@@ -17,6 +17,7 @@ import {
   writeString,
   writeUInt64BE,
 } from '../src/protocol/sftp/mod.ts';
+import { SFTP } from '../src/protocol/sftp/SFTP.ts';
 
 // =============================================================================
 // toUnixTimestamp
@@ -448,4 +449,82 @@ Deno.test('PacketParser: readAttrs returns undefined when SIZE data missing', ()
   const extra = new Uint8Array(4);
   p.init(buildAttrsBuffer(ATTR.SIZE, extra));
   assertEquals(p.readAttrs(), undefined);
+});
+
+// =============================================================================
+// SFTP.push assembling a WRITE
+// =============================================================================
+
+/** A server's SFTP session that has taken INIT, and the bytes of a WRITE for it. */
+function writeAssembly(dataLength: number) {
+  const sftp = new SFTP(
+    { protocol: { channelData() {}, channelClose() {} } },
+    {
+      type: 'session',
+      incoming: { id: 0, window: 1 << 21, packetSize: 32768, state: 'open' },
+      outgoing: { id: 0, window: 1 << 21, packetSize: 32768, state: 'open' },
+    },
+    { server: true },
+  );
+  sftp.push(new Uint8Array([0, 0, 0, 5, 1, 0, 0, 0, 3]));
+
+  const handle = new Uint8Array([7, 7, 7, 7]);
+  const data = new Uint8Array(dataLength);
+  for (let i = 0; i < data.length; i++) data[i] = (i * 7) & 0xff;
+  const body = 1 + 4 + 4 + handle.length + 8 + 4 + data.length;
+  const packet = new Uint8Array(4 + body);
+  const view = new DataView(packet.buffer);
+  view.setUint32(0, body);
+  packet[4] = 6; // WRITE
+  view.setUint32(5, 42);
+  view.setUint32(9, handle.length);
+  packet.set(handle, 13);
+  view.setBigUint64(13 + handle.length, 65536n);
+  view.setUint32(21 + handle.length, data.length);
+  packet.set(data, 25 + handle.length);
+
+  const writes: { id: number; handle: Uint8Array; offset: number | bigint; data: Uint8Array }[] =
+    [];
+  sftp.on('WRITE', (id: number, h: Uint8Array, offset: number | bigint, d: Uint8Array) => {
+    writes.push({ id, handle: h, offset, data: d });
+  });
+  return { sftp, packet, handle, data, writes };
+}
+
+Deno.test('SFTP.push: a WRITE spanning pushes has its data in a buffer it fills', () => {
+  const { sftp, packet, handle, data, writes } = writeAssembly(32768);
+  // Cut within the length and within the data, as channel packets may cut it.
+  const parts = [packet.subarray(0, 2), packet.subarray(2, 20000), packet.subarray(20000)];
+  for (const part of parts) sftp.push(part.slice());
+
+  assertEquals(writes.length, 1);
+  const [write] = writes;
+  assertEquals(write.id, 42);
+  assertEquals(write.handle, handle);
+  assertEquals(write.offset, 65536);
+  assertEquals(write.data, data);
+  assertEquals(write.data.byteOffset, 0);
+  assertEquals(write.data.byteLength, write.data.buffer.byteLength);
+  // Taking the buffer leaves the handle, assembled apart, as it was.
+  structuredClone(write.data, { transfer: [write.data.buffer as ArrayBuffer] });
+  assertEquals(write.handle, handle);
+});
+
+Deno.test('SFTP.push: a WRITE whose fields before the data span pushes is assembled whole', () => {
+  const { sftp, packet, data, writes } = writeAssembly(1000);
+  sftp.push(packet.slice(0, 15));
+  sftp.push(packet.slice(15));
+
+  assertEquals(writes.length, 1);
+  assertEquals(writes[0].data, data);
+  assertEquals(writes[0].data.byteLength < writes[0].data.buffer.byteLength, true);
+});
+
+Deno.test('SFTP.push: a WRITE in one push is a view of it', () => {
+  const { sftp, packet, data, writes } = writeAssembly(1000);
+  sftp.push(packet);
+
+  assertEquals(writes.length, 1);
+  assertEquals(writes[0].data, data);
+  assertEquals(writes[0].data.buffer, packet.buffer);
 });

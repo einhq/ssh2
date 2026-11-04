@@ -662,7 +662,9 @@ import { Client, generateKeyPair, parseKey, Server } from 'jsr:@ein/ssh2-ts';
 - **sftp**(accept, reject) - Client wants an SFTP session. The SFTP server built on its channel
   emits one event per request (`OPEN`, `READ`, `WRITE`, …). A `WRITE`'s `data` belongs to the
   listener: ssh2-ts never reuses that buffer, so it can be kept until the bytes are written, without
-  a copy.
+  a copy. When `data` fills its `ArrayBuffer` (`byteOffset` 0, `byteLength` the buffer's), as it
+  does for a `WRITE` that spanned channel packets, the buffer holds nothing else and is the
+  listener's too, to transfer to a worker, say.
 
 - **pty**(accept, reject, info) - Client wants a pseudo-TTY. `info` contains `term`, `cols`, `rows`,
   `width`, `height`, `modes`.
