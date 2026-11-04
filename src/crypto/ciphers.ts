@@ -147,14 +147,10 @@ export class NullDecipher implements Decipher {
       // Read padding length, payload, and padding
       if (this._packetPos < this._len) {
         const nb = Math.min(this._len - this._packetPos, dataLen - p);
-        let chunk: Uint8Array;
-        if (p !== 0 || nb !== dataLen) {
-          chunk = data.subarray(p, p + nb);
-        } else {
-          chunk = data;
-        }
+        const chunk = data.subarray(p, p + nb);
         if (nb === this._len) {
-          this._packet = chunk;
+          // A copy: the payload may be kept (KEXINIT), and the caller reuses data.
+          this._packet = chunk.slice();
         } else {
           if (!this._packet) {
             this._packet = allocBytes(this._len);

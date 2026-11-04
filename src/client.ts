@@ -38,6 +38,7 @@ import {
   onChannelOpenFailure,
 } from './utils.ts';
 import { EventEmitter } from './utils/events.ts';
+import { transportChunks } from './utils/transport-read.ts';
 import { coalesceTransportWrite } from './utils/transport-write.ts';
 
 const STDERR = CHANNEL_EXTENDED_DATATYPE.STDERR;
@@ -847,15 +848,10 @@ export class Client extends EventEmitter<ClientEvents> {
   private async _startReading() {
     if (!this._transport) return;
 
-    const reader = this._transport.readable.getReader();
-
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
+      for await (const chunk of transportChunks(this._transport)) {
         try {
-          await this._protocol?.parse(value, 0, value.length);
+          await this._protocol?.parse(chunk, 0, chunk.length);
         } catch (err) {
           this.emit('error', err as Error);
           this.end();
@@ -867,7 +863,6 @@ export class Client extends EventEmitter<ClientEvents> {
         this.emit('error', err as Error);
       }
     } finally {
-      reader.releaseLock();
       this._cleanup(new Error('Connection lost'));
       this.emit('end');
       this.emit('close');

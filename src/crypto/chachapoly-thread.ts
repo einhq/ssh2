@@ -1,11 +1,12 @@
 /**
- * chacha20-poly1305@openssh.com sealing on a worker thread.
+ * chacha20-poly1305@openssh.com sealing and opening on a worker thread.
  *
- * Sealing a 32 KiB packet takes the thread that does it about 40 µs, most of it
- * Poly1305 and ChaCha20. A connection's large outbound packets go to one
+ * Sealing or opening a 32 KiB packet takes the thread that does it about 40 µs,
+ * most of it Poly1305 and ChaCha20. A connection's large packets go to one
  * worker, shared by every connection in the process, in batches: a message
  * costs the main thread about 23 µs there and back, whatever its size, so a
- * batch carries as many packets as are waiting.
+ * batch carries as many packets as are waiting. Opened payloads are written
+ * to a buffer the worker allocates, so that its pages are faulted in there.
  *
  * The worker is started from a Blob URL holding the source of
  * `chachaPolyWorker`, so it needs no module of its own to be fetched or cached.
@@ -25,9 +26,13 @@ const IDLE_MS = 1000;
 const spare: ArrayBuffer[] = [];
 const MAX_SPARE = 8;
 
-/** A request to the worker. Packets lie back to back in `buf`, `used` bytes of it. */
+/**
+ * A request to the worker. Packets lie back to back in `buf`, `used` bytes of
+ * it: to be sealed, packets as allocPacket() lays them out; to be opened, the
+ * records as they arrived, each its encrypted length, packet and MAC.
+ */
 interface BatchRequest {
-  op: 'seal';
+  op: 'seal' | 'open';
   seq: number;
   key: Uint8Array;
   seqno: number;
@@ -44,8 +49,12 @@ interface BatchReply {
   seq: number;
   /** The request's buffer, handed back to be filled again. */
   buf: ArrayBuffer;
-  /** The sealed records, back to back. */
+  /** The sealed records, or the opened payloads, back to back. */
   out: ArrayBuffer;
+  /** Opened: each payload's length. */
+  lens?: number[];
+  /** Opened: why the packet after those in `lens` could not be. */
+  error?: string;
 }
 
 /**
@@ -131,6 +140,35 @@ function chachaPolyWorker(createCipheriv: typeof import('node:crypto').createCip
     return out;
   };
 
+  const open = (src: Uint8Array, seqno: number) => {
+    const out = new Uint8Array(new ArrayBuffer(src.length));
+    const lens: number[] = [];
+    let w = 0;
+    for (let o = 0; o < src.length; seqno = (seqno + 1) >>> 0) {
+      begin(seqno);
+      mem.set(src.subarray(o, o + 4), PACKET);
+      wasm.chacha20(KEY_LEN, NONCE, 0, PACKET, 4);
+      const len = readU32(mem, PACKET);
+      const pktLen = len + 4;
+      reserve(pktLen + 16);
+      mem.set(src.subarray(o, o + pktLen), PACKET);
+      wasm.poly1305(POLY_KEY, PACKET, pktLen, PACKET + pktLen);
+      let diff = 0;
+      for (let i = 0; i < 16; i++) diff |= mem[PACKET + pktLen + i] ^ src[o + pktLen + i];
+      if (diff !== 0) return { out, lens, error: 'Invalid MAC' };
+      // Packets come here from THREAD_MIN (chacha20.ts) bytes on, all native-sized.
+      const plain = native(src.subarray(o + 4, o + pktLen));
+      const padLen = plain[0];
+      if (padLen > len - 1) return { out, lens, error: 'Invalid padding length' };
+      const payloadLen = len - 1 - padLen;
+      out.set(plain.subarray(1, 1 + payloadLen), w);
+      w += payloadLen;
+      lens.push(payloadLen);
+      o += pktLen + 16;
+    }
+    return { out, lens };
+  };
+
   const scope = self as unknown as Scope;
   scope.onmessage = ({ data }) => {
     if (data.op === 'init') {
@@ -141,8 +179,17 @@ function chachaPolyWorker(createCipheriv: typeof import('node:crypto').createCip
     }
     mem.set(data.key.subarray(0, 64), KEY_MAIN);
     keyMain.set(data.key.subarray(0, 32));
-    const out = seal(new Uint8Array(data.buf, 0, data.used), data.seqno);
-    scope.postMessage({ seq: data.seq, buf: data.buf, out: out.buffer }, [data.buf, out.buffer]);
+    const src = new Uint8Array(data.buf, 0, data.used);
+    if (data.op === 'seal') {
+      const out = seal(src, data.seqno);
+      scope.postMessage({ seq: data.seq, buf: data.buf, out: out.buffer }, [data.buf, out.buffer]);
+      return;
+    }
+    const { out, lens, error } = open(src, data.seqno);
+    scope.postMessage({ seq: data.seq, buf: data.buf, out: out.buffer, lens, error }, [
+      data.buf,
+      out.buffer,
+    ]);
   };
 }
 
@@ -217,6 +264,7 @@ const startedThread = (): Thread => {
 };
 
 const request = (
+  op: BatchRequest['op'],
   key: Uint8Array,
   seqno: number,
   buf: ArrayBuffer,
@@ -226,7 +274,7 @@ const request = (
   const seq = nextSeq++;
   const { promise, resolve, reject } = Promise.withResolvers<BatchReply>();
   owner.replies.set(seq, { resolve, reject });
-  owner.worker.postMessage({ op: 'seal', seq, key, seqno, buf, used } satisfies BatchRequest, [
+  owner.worker.postMessage({ op, seq, key, seqno, buf, used } satisfies BatchRequest, [
     buf,
   ]);
   return promise;
@@ -250,6 +298,29 @@ export async function sealOnThread(
   buf: ArrayBuffer,
   used: number,
 ): Promise<Uint8Array> {
-  const reply = await request(key, seqno, buf, used);
+  const reply = await request('seal', key, seqno, buf, used);
   return new Uint8Array(reply.out);
+}
+
+/** Payloads opened on the worker, back to back in `out`. */
+export interface Opened {
+  out: ArrayBuffer;
+  lens: number[];
+  /** Why the packet after those opened failed, if one did. */
+  error?: string;
+}
+
+/**
+ * Opens the records in the first `used` bytes of `buf`, which is handed over,
+ * the first under `seqno`. Payloads are opened until one fails its MAC or
+ * padding check.
+ */
+export async function openOnThread(
+  key: Uint8Array,
+  seqno: number,
+  buf: ArrayBuffer,
+  used: number,
+): Promise<Opened> {
+  const { out, lens, error } = await request('open', key, seqno, buf, used);
+  return { out, lens: lens!, error };
 }

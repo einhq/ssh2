@@ -13,21 +13,19 @@
  * is paid off.
  *
  * A packet is copied as little as it can be: an outbound one is filled where
- * it is encrypted, and an inbound payload that went through the native
- * cipher is handed on as a view of the native output.
+ * it is encrypted, and an inbound one is opened in place.
  *
- * Outbound packets with a payload of THREAD_MIN bytes or more, and those that
- * queue behind them, are sealed on a worker thread instead
- * (chachapoly-thread.ts), in batches, so that a download's cipher work leaves
- * the calling thread. Inbound packets are opened here: a message per socket
- * read costs about as much main-thread time as opening its packets saves.
+ * Packets of THREAD_MIN bytes or more go to a worker thread instead
+ * (chachapoly-thread.ts), in batches, so that a transfer's cipher work leaves
+ * the calling thread: outbound ones with those that queue behind them, inbound
+ * ones as many as a transport read brings.
  */
 
 import { createCipheriv } from 'node:crypto';
 import { readUInt32BE, writeUInt32BE } from '../utils/binary.ts';
 import type { Cipher, CipherConfig, Decipher, DecipherConfig } from './ciphers.ts';
 import { CHACHAPOLY_WASM } from './chachapoly-wasm.ts';
-import { batchBuffer, sealOnThread } from './chachapoly-thread.ts';
+import { batchBuffer, openOnThread, sealOnThread } from './chachapoly-thread.ts';
 import { randomFill } from './random.ts';
 import { timingSafeEqual } from './utils.ts';
 
@@ -131,8 +129,9 @@ class ChaChaPoly {
 
 /**
  * Payload size from which an outbound packet is sealed on the worker thread
- * even when none of its connection's packets wait there. Smaller ones are
- * sealed here, where they cost less than a message.
+ * even when none of its connection's packets wait there, and packet length
+ * from which an inbound one is opened there. Smaller ones are handled here,
+ * where they cost less than a message.
  */
 const THREAD_MIN = 2048;
 
@@ -323,16 +322,40 @@ type PayloadCallback = (
   payload: Uint8Array,
 ) => void | boolean | number | Promise<void | boolean | number>;
 
+/** Inbound records on their way to the worker thread, back to back in `buf`. */
+interface InBatch {
+  buf: ArrayBuffer;
+  bytes: Uint8Array;
+  used: number;
+  /** Sequence number of the first record. */
+  seqno: number;
+  /** Where each record ends in the data decrypt() was given. */
+  ends: number[];
+}
+
 /**
  * ChaCha20-Poly1305 Decipher for SSH
  *
  * A packet's bytes are gathered at PACKET in the instance's memory as they
  * arrive: the encrypted length, the encrypted packet, then the MAC at TAG.
+ *
+ * A packet of THREAD_MIN bytes or more is opened on the worker thread instead,
+ * together with the others of its size in the same decrypt() call: its record
+ * is added to a batch, straight from the data when all of it is there. The
+ * batch is opened, and its payloads delivered, before a smaller packet is
+ * handled and before decrypt() returns, so packets keep their order. When a
+ * handler stops the decipher, the batch's later payloads, opened under the old
+ * keys, are dropped, and decrypt() returns where the stopping record ended. A bulk
+ * transfer's transport reads are paced so that each brings many packets
+ * (transport-read.ts). Those payloads are views of one buffer per batch.
  */
 export class ChaChaPolyDecipher implements Decipher {
   inSeqno: number;
   private _onPayload: PayloadCallback;
   private _state: ChaChaPoly;
+  private _key: Uint8Array;
+  private _batch: InBatch | undefined;
+  private _dead = false;
 
   // State for incremental decryption
   private _len = 0;
@@ -346,9 +369,13 @@ export class ChaChaPolyDecipher implements Decipher {
     this._onPayload = dec.onPayload;
     this._state = new ChaChaPoly(dec.decipherKey);
     this._state.reserve(4 + MAX_PACKET_SIZE);
+    this._key = dec.decipherKey.slice(0, 64);
   }
 
-  free(): void {}
+  free(): void {
+    this._dead = true;
+    this._batch = undefined;
+  }
 
   async decrypt(
     data: Uint8Array,
@@ -364,7 +391,7 @@ export class ChaChaPolyDecipher implements Decipher {
         mem.set(data.subarray(p, p + nb), PACKET + this._lenPos);
         p += nb;
         this._lenPos += nb;
-        if (this._lenPos < 4) return;
+        if (this._lenPos < 4) break;
 
         // The MAC covers the encrypted length, so decrypt a copy.
         state.begin(this.inSeqno);
@@ -375,16 +402,25 @@ export class ChaChaPolyDecipher implements Decipher {
         if (this._len > MAX_PACKET_SIZE || this._len < 8 || (this._len & 7) !== 0) {
           throw new Error('Bad packet length');
         }
+
+        const rest = this._len + 16;
+        if (this._len >= THREAD_MIN && nb === 4 && dataLen - p >= rest) {
+          const stopped = await this._add(p + rest, data.subarray(p - 4, p + rest));
+          if (stopped !== undefined) return stopped;
+          p += rest;
+          this._next();
+          continue;
+        }
       }
 
       // Read encrypted payload
       if (this._pktLen < this._len) {
-        if (p >= dataLen) return;
+        if (p >= dataLen) break;
         const nb = Math.min(this._len - this._pktLen, dataLen - p);
         mem.set(data.subarray(p, p + nb), PACKET + 4 + this._pktLen);
         p += nb;
         this._pktLen += nb;
-        if (this._pktLen < this._len || p >= dataLen) return;
+        if (this._pktLen < this._len || p >= dataLen) break;
       }
 
       // Read Poly1305 MAC (16 bytes)
@@ -393,10 +429,25 @@ export class ChaChaPolyDecipher implements Decipher {
         mem.set(data.subarray(p, p + nb), TAG + this._macPos);
         p += nb;
         this._macPos += nb;
-        if (this._macPos < 16) return;
+        if (this._macPos < 16) break;
       }
 
       const len = this._len;
+      if (len >= THREAD_MIN) {
+        const stopped = await this._add(
+          p,
+          mem.subarray(PACKET, PACKET + 4 + len),
+          mem.subarray(TAG, TAG + 16),
+        );
+        if (stopped !== undefined) return stopped;
+        this._next();
+        continue;
+      }
+
+      // The batch's packets came first.
+      const stopped = await this._flush();
+      if (stopped !== undefined) return stopped;
+
       state.mac(4 + len, EXPECTED_TAG);
       if (
         !timingSafeEqual(
@@ -407,35 +458,78 @@ export class ChaChaPolyDecipher implements Decipher {
         throw new Error('Invalid MAC');
       }
 
-      let payload: Uint8Array;
-      if (len < NATIVE_MIN) {
-        state.payload(len);
-        const padLen = mem[PACKET + 4];
-        if (padLen > len - 1) {
-          throw new Error('Invalid padding length');
-        }
-        payload = mem.slice(PACKET + 5, PACKET + 4 + len - padLen);
-      } else {
-        // The native output is a buffer of its own: the payload is a view of it.
-        const plain = state.native(len);
-        const padLen = plain[0];
-        if (padLen > len - 1) {
-          throw new Error('Invalid padding length');
-        }
-        payload = new Uint8Array(plain.buffer, plain.byteOffset + 1, len - 1 - padLen);
+      state.payload(len);
+      const padLen = mem[PACKET + 4];
+      if (padLen > len - 1) {
+        throw new Error('Invalid padding length');
       }
+      const payload = mem.slice(PACKET + 5, PACKET + 4 + len - padLen);
 
-      // Prepare for next packet
-      this.inSeqno = (this.inSeqno + 1) >>> 0;
-      this._len = 0;
-      this._lenPos = 0;
-      this._pktLen = 0;
-      this._macPos = 0;
+      this._next();
 
       const ret = await this._onPayload(payload);
       if (ret !== undefined) {
         return ret === false ? p : ret;
       }
     }
+    return await this._flush();
+  }
+
+  /** Prepares for the next packet. */
+  private _next(): void {
+    this.inSeqno = (this.inSeqno + 1) >>> 0;
+    this._len = 0;
+    this._lenPos = 0;
+    this._pktLen = 0;
+    this._macPos = 0;
+  }
+
+  /**
+   * Adds a record ending at `end` in the data, given whole or as its packet and
+   * its MAC, to the batch. A full batch is opened first; what decrypt() is to
+   * return if that stopped the decipher is returned.
+   */
+  private async _add(
+    end: number,
+    record: Uint8Array,
+    tag?: Uint8Array,
+  ): Promise<void | boolean | number> {
+    const size = record.length + (tag?.length ?? 0);
+    if (this._batch && this._batch.used + size > this._batch.bytes.length) {
+      const stopped = await this._flush();
+      if (stopped !== undefined) return stopped;
+    }
+    let batch = this._batch;
+    if (!batch) {
+      const buf = batchBuffer(size);
+      batch = { buf, bytes: new Uint8Array(buf), used: 0, seqno: this.inSeqno, ends: [] };
+      this._batch = batch;
+    }
+    batch.bytes.set(record, batch.used);
+    if (tag) batch.bytes.set(tag, batch.used + record.length);
+    batch.used += size;
+    batch.ends.push(end);
+  }
+
+  /**
+   * Opens the batch on the thread and delivers its payloads, returning what
+   * decrypt() is to return if a handler stopped the decipher.
+   */
+  private async _flush(): Promise<void | boolean | number> {
+    const batch = this._batch;
+    if (!batch) return;
+    this._batch = undefined;
+    const { out, lens, error } = await openOnThread(this._key, batch.seqno, batch.buf, batch.used);
+    let offset = 0;
+    for (let i = 0; i < lens.length; i++) {
+      if (this._dead) return;
+      const ret = await this._onPayload(new Uint8Array(out, offset, lens[i]));
+      if (ret !== undefined) {
+        this.inSeqno = (batch.seqno + i + 1) >>> 0;
+        return ret === false ? batch.ends[i] : ret;
+      }
+      offset += lens[i];
+    }
+    if (error) throw new Error(error);
   }
 }

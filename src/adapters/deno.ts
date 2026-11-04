@@ -39,6 +39,10 @@ export class DenoTransport implements Transport {
     return this._conn.writable;
   }
 
+  read(buf: Uint8Array): Promise<number | null> {
+    return this._conn.read(buf);
+  }
+
   get remoteAddress(): string | undefined {
     const addr = this._conn.remoteAddr;
     if (addr.transport === 'tcp' || addr.transport === 'udp') {

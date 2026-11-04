@@ -324,7 +324,8 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
 
   /**
    * Parse incoming data
-   * Returns a Promise that resolves when data has been processed
+   * Returns a Promise that resolves when data has been processed. Nothing keeps
+   * a view of the chunk, so the caller may fill it again once the promise settles.
    */
   async parse(chunk: Uint8Array, i = 0, len = chunk.length): Promise<void> {
     this._debug?.(`parse: received ${len - i} bytes, parseMode=${this._parseMode}`);
@@ -384,7 +385,7 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
       if (this._buffer) {
         this._buffer = concatBytes([this._buffer, chunk.subarray(i, len)]);
       } else {
-        this._buffer = chunk.subarray(i, len);
+        this._buffer = chunk.slice(i, len);
       }
       return len;
     }
@@ -406,7 +407,7 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
 
     // Check for SSH-2.0 identifier
     if (lineStr.startsWith('SSH-2.0-') || lineStr.startsWith('SSH-1.99-')) {
-      this._remoteIdentRaw = line;
+      this._remoteIdentRaw = line.slice();
       this._debug?.(`Remote ident: ${lineStr}`);
 
       // Parse the header

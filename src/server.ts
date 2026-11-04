@@ -34,6 +34,7 @@ import {
 } from './utils.ts';
 import { allocBytes, writeUInt32BE } from './utils/binary.ts';
 import { EventEmitter } from './utils/events.ts';
+import { transportChunks } from './utils/transport-read.ts';
 import { coalesceTransportWrite } from './utils/transport-write.ts';
 
 const MAX_PENDING_AUTHS = 10;
@@ -1319,8 +1320,15 @@ export class Connection extends EventEmitter<ConnectionEvents> {
   private _writeToTransport(data: Uint8Array): void {
     if (this._transport.closed) return;
     this._writeQueue.push(data);
-    this._processWriteQueue();
+    if (!this._holdWrites) this._processWriteQueue();
   }
+
+  /**
+   * Set between a bulk transfer's reads (transportChunks): what is written
+   * meanwhile, such as the replies to an upload's SFTP writes, goes out
+   * together before the next read starts.
+   */
+  private _holdWrites = false;
 
   /**
    * Process the write queue
@@ -1369,24 +1377,26 @@ export class Connection extends EventEmitter<ConnectionEvents> {
    */
   private async _startReading(): Promise<void> {
     try {
-      const reader = this._transport.readable.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          this._debug?.('Transport closed');
-          this.emit('end');
+      let ended = true;
+      const bulk = (busy: boolean) => {
+        this._holdWrites = busy;
+        if (!busy && this._writeQueue.length > 0 && !this._transport.closed) {
+          this._processWriteQueue();
+        }
+      };
+      for await (const chunk of transportChunks(this._transport, bulk)) {
+        try {
+          await this._protocol.parse(chunk, 0, chunk.length);
+        } catch (err) {
+          this.emit('error', err as Error);
+          ended = false;
           break;
         }
-        if (value) {
-          try {
-            await this._protocol.parse(value, 0, value.length);
-          } catch (err) {
-            this.emit('error', err as Error);
-            break;
-          }
-        }
       }
-      reader.releaseLock();
+      if (ended) {
+        this._debug?.('Transport closed');
+        this.emit('end');
+      }
     } catch (err) {
       if (this._transport.closed) {
         // This side closed the transport (a DISCONNECT, end()), which fails the
@@ -1412,8 +1422,11 @@ export class Connection extends EventEmitter<ConnectionEvents> {
     this._protocol.disconnect(DISCONNECT_REASON.BY_APPLICATION);
     const close = () => {
       this._closing = true;
+      // Held writes, the DISCONNECT among them, go out first; _processWriteQueue then closes
+      this._holdWrites = false;
+      if (this._writeQueue.length > 0) this._processWriteQueue();
       // If no write is in progress, close immediately; otherwise _processWriteQueue will close
-      if (!this._writeInProgress) {
+      else if (!this._writeInProgress) {
         this._releaseWriter();
         this._transport.close();
       }

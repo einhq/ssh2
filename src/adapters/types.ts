@@ -19,6 +19,13 @@ export interface Transport {
   /** Writable stream for outgoing data */
   readonly writable: WritableStream<Uint8Array>;
 
+  /**
+   * Reads into buf, resolving to the number of bytes read, or null at the end.
+   * A transport that has it is read through it rather than `readable`, into a
+   * buffer reused for every read.
+   */
+  read?(buf: Uint8Array): Promise<number | null>;
+
   /** Remote address information (if available) */
   readonly remoteAddress?: string;
 

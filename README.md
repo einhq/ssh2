@@ -820,8 +820,13 @@ The two features Web Crypto does not cover are provided without any third-party 
   `deno task build:wasm`), with payloads of 2 KiB and more encrypted by the runtime's native
   `chacha20` cipher from `node:crypto` (available in Deno 2.9.4+). Outbound packets with a payload
   of 2 KiB or more, and those sent while any wait, are sealed in batches on a web Worker shared by
-  every connection in the process (`src/crypto/chachapoly-thread.ts`), so that a download's cipher
-  work leaves the main thread; the Worker stops after 1 s without work.
+  every connection in the process (`src/crypto/chachapoly-thread.ts`), and inbound packets of 2 KiB
+  or more are opened there, as many as a socket read brings, so that a transfer's cipher work leaves
+  the main thread; the Worker stops after 1 s without work. A connection over a `DenoTransport`
+  reads its socket into one 256 KiB buffer. During a bulk transfer (reads of 32 KiB or more) the
+  next read waits 1 ms when the last one did not fill the buffer, so that it brings many packets at
+  once, and on the server what the connection writes between two such reads, such as the replies to
+  an upload's SFTP writes, goes out in one write before the next read starts.
 - **`bcrypt` KDF** — used when reading or writing passphrase-protected OpenSSH private keys
   (`src/keygen.ts`, `src/protocol/keyParser.ts`); provided by a vendored `bcrypt_pbkdf`
   implementation (`src/crypto/bcrypt-pbkdf.ts`).
