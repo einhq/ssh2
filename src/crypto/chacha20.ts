@@ -11,6 +11,10 @@
  * native node:crypto ChaCha20 (requires a Deno version whose node:crypto
  * supports the raw "chacha20" cipher), which is faster once its per-call setup
  * is paid off.
+ *
+ * A packet is copied as little as it can be: an outbound one is filled where
+ * it is encrypted, and an inbound payload that went through the native
+ * cipher is handed on as a view of the native output.
  */
 
 import { createCipheriv } from 'node:crypto';
@@ -92,14 +96,24 @@ class ChaChaPoly {
       this.wasm.chacha20(KEY_MAIN, NONCE, 1, start, len);
       return;
     }
+    this.mem.set(this.native(len), start);
+  }
+
+  /**
+   * The len payload bytes at PACKET + 4 encrypted or decrypted by the native
+   * ChaCha20, as a buffer of their own; memory is left as it was.
+   */
+  native(len: number): Uint8Array {
+    const start = PACKET + 4;
     this._iv.set(this.mem.subarray(NONCE, NONCE + 8), 8);
     // The native counter is 32-bit little-endian, then a 96-bit nonce:
     // counter(4) || 0x00000000 || nonce(8) is the DJB counter-and-nonce block.
     const cipher = createCipheriv('chacha20', this._keyMain, this._iv);
-    this.mem.set(cipher.update(this.mem.subarray(start, start + len)), start);
+    const out = cipher.update(this.mem.subarray(start, start + len));
     // Deno keeps the native cipher context in its resource table until final(),
     // so a stream cipher is finalized although it has nothing left to emit.
     cipher.final();
+    return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
   }
 
   /** Writes the Poly1305 tag of the len bytes at PACKET to out. */
@@ -133,13 +147,20 @@ export class ChaChaPolyCipher implements Cipher {
     this._dead = true;
   }
 
+  /**
+   * The packet is laid out in the instance's memory, where encrypt() works on
+   * it, so filling it is the payload's only copy. It is valid until the next
+   * allocPacket() or encrypt().
+   */
   allocPacket(payloadLen: number): Uint8Array {
     let pktLen = 4 + 1 + payloadLen;
     let padLen = 8 - ((pktLen - 4) & (8 - 1));
     if (padLen < 4) padLen += 8;
     pktLen += padLen;
 
-    const packet = new Uint8Array(pktLen);
+    const state = this._state;
+    state.reserve(pktLen + 16);
+    const packet = state.mem.subarray(PACKET, PACKET + pktLen);
     writeUInt32BE(packet, pktLen - 4, 0);
     packet[4] = padLen;
     randomFill(packet, 5 + payloadLen, padLen);
@@ -152,8 +173,10 @@ export class ChaChaPolyCipher implements Cipher {
 
     const state = this._state;
     const len = packet.length;
-    state.reserve(len + 16);
-    state.mem.set(packet, PACKET);
+    if (packet.buffer !== state.mem.buffer || packet.byteOffset !== PACKET) {
+      state.reserve(len + 16);
+      state.mem.set(packet, PACKET);
+    }
     state.begin(this.outSeqno);
     state.length(PACKET);
     state.payload(len - 4);
@@ -253,13 +276,23 @@ export class ChaChaPolyDecipher implements Decipher {
         throw new Error('Invalid MAC');
       }
 
-      state.payload(len);
-
-      const padLen = mem[PACKET + 4];
-      if (padLen > len - 1) {
-        throw new Error('Invalid padding length');
+      let payload: Uint8Array;
+      if (len < NATIVE_MIN) {
+        state.payload(len);
+        const padLen = mem[PACKET + 4];
+        if (padLen > len - 1) {
+          throw new Error('Invalid padding length');
+        }
+        payload = mem.slice(PACKET + 5, PACKET + 4 + len - padLen);
+      } else {
+        // The native output is a buffer of its own: the payload is a view of it.
+        const plain = state.native(len);
+        const padLen = plain[0];
+        if (padLen > len - 1) {
+          throw new Error('Invalid padding length');
+        }
+        payload = new Uint8Array(plain.buffer, plain.byteOffset + 1, len - 1 - padLen);
       }
-      const payload = mem.slice(PACKET + 5, PACKET + 4 + len - padLen);
 
       // Prepare for next packet
       this.inSeqno = (this.inSeqno + 1) >>> 0;

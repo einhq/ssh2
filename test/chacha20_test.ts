@@ -276,15 +276,59 @@ Deno.test('ChaChaPolyDecipher opens records fed whole, in pieces, and back to ba
   }
 });
 
+Deno.test('ChaChaPolyCipher seals a packet it did not allocate the same way', () => {
+  for (const size of [20, 3000, 32781]) {
+    const records: Uint8Array[] = [];
+    const cipher = new ChaChaPolyCipher({
+      outbound: {
+        seqno: 3,
+        onWrite: (data) => records.push(data),
+        cipherInfo: CIPHER_INFO['chacha20-poly1305@openssh.com'],
+        cipherKey: Uint8Array.from({ length: 64 }, (_, i) => i),
+        cipherIV: new Uint8Array(0),
+      },
+    });
+    const sealed = seal(3, size);
+    const packet = new Uint8Array(sealed.length - 16);
+    packet.set(cipher.allocPacket(size).subarray(0, 4));
+    for (let i = 4; i < packet.length; i++) packet[i] = (i * 31) & 0xff;
+    packet[4] = packet.length - 5 - size;
+    cipher.encrypt(packet);
+    assertEquals(toHex(records[0]), toHex(sealed), `${size} bytes`);
+  }
+});
+
+Deno.test('ChaChaPolyCipher hands out records that later packets do not overwrite', () => {
+  for (const size of [20, 32781]) {
+    const records: Uint8Array[] = [];
+    const cipher = new ChaChaPolyCipher({
+      outbound: {
+        seqno: 0,
+        onWrite: (data) => records.push(data),
+        cipherInfo: CIPHER_INFO['chacha20-poly1305@openssh.com'],
+        cipherKey: Uint8Array.from({ length: 64 }, (_, i) => i),
+        cipherIV: new Uint8Array(0),
+      },
+    });
+    cipher.encrypt(cipher.allocPacket(size));
+    const copy = toHex(records[0]);
+    cipher.encrypt(cipher.allocPacket(size));
+    assertEquals(toHex(records[0]), copy, `${size} bytes`);
+  }
+});
+
 Deno.test('ChaChaPolyDecipher hands out payloads that later packets do not overwrite', async () => {
-  const payloads: Uint8Array[] = [];
-  const d = decipher(7, payloads);
-  const first = seal(7, 20);
-  const second = seal(8, 20);
-  await d.decrypt(first, 0, first.length);
-  const copy = toHex(payloads[0]);
-  await d.decrypt(second, 0, second.length);
-  assertEquals(toHex(payloads[0]), copy);
+  for (const size of [20, 3000, 32781]) {
+    const payloads: Uint8Array[] = [];
+    const d = decipher(7, payloads);
+    const first = seal(7, size);
+    const second = seal(8, size);
+    await d.decrypt(first, 0, first.length);
+    const copy = toHex(payloads[0]);
+    await d.decrypt(second, 0, second.length);
+    assertEquals(toHex(payloads[0]), copy, `${size} bytes`);
+    assertEquals(payloads[0].length, size);
+  }
 });
 
 Deno.test('ChaChaPolyDecipher rejects a record with a flipped bit', async () => {
