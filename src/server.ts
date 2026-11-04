@@ -1806,9 +1806,11 @@ export class Server extends EventEmitter<ServerEvents> {
   }
 
   /**
-   * Inject a socket/transport
+   * Serves a connection on a transport this server did not accept itself. The
+   * host keys are prepared first, as listen() prepares them.
    */
-  injectTransport(transport: Transport): void {
+  async injectTransport(transport: Transport): Promise<void> {
+    await this._initHostKeys();
     if (this._connections >= this.maxConnections) {
       transport.close();
       return;
