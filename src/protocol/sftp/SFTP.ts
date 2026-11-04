@@ -237,7 +237,10 @@ export class SFTP extends EventEmitter {
   }
 
   /**
-   * Handle incoming data
+   * Handle incoming data: the payloads of the channel's packets, in order. A
+   * request is handed on as a view of the data it arrived in, or, when it spans
+   * several pushes, of a buffer of its own, so the data pushed must not be
+   * reused: a WRITE's data belongs to its listener.
    */
   push(data: Uint8Array | null): void {
     if (data === null) {
@@ -1894,6 +1897,7 @@ export class SFTP extends EventEmitter {
     return this._emitServerRequest('READ', reqId!, handle, offset, length);
   }
 
+  /** The data is the listener's to keep without a copy; nothing here reuses it. */
   private _handleWrite(payload: Uint8Array): boolean {
     this._parser.init(payload, 1);
     const reqId = this._parser.readUInt32BE();

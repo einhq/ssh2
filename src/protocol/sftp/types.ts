@@ -245,6 +245,7 @@ export interface WriteRequest {
   reqId: number;
   handle: SFTPHandle;
   offset: number | bigint;
+  /** The listener's to keep: ssh2-ts never reuses it. */
   data: Uint8Array;
 }
 

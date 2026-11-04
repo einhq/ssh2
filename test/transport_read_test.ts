@@ -4,6 +4,9 @@ import type { Channel } from '../src/Channel.ts';
 import { Client } from '../src/client.ts';
 import { type Connection, Server, type ServerAuthContext, type Session } from '../src/server.ts';
 import { PACE_MIN, READ_BUFFER, transportChunks } from '../src/utils/transport-read.ts';
+import { SFTP } from '../src/protocol/sftp/SFTP.ts';
+import { STATUS_CODE } from '../src/protocol/sftp/constants.ts';
+import type { SFTPHandle } from '../src/protocol/sftp/types.ts';
 import { generateTestHostKeyEd25519 } from './integration_helpers.ts';
 
 /** A transport whose reads come from a list of sizes, each filled with its index. */
@@ -160,3 +163,89 @@ Deno.test({
     server.close();
   },
 });
+
+for (const cipher of ['chacha20-poly1305@openssh.com', 'aes128-gcm@openssh.com', 'aes128-ctr']) {
+  Deno.test({
+    name: `an SFTP WRITE's data is the listener's to keep (${cipher})`,
+    sanitizeResources: false,
+    sanitizeOps: false,
+    async fn() {
+      const toServer = new TransformStream<Uint8Array, Uint8Array>();
+      const toClient = new TransformStream<Uint8Array, Uint8Array>();
+      const clientEnd = new ReadingTransport(toClient.readable, toServer.writable);
+      const serverEnd = new ReadingTransport(toServer.readable, toClient.writable);
+
+      // Large writes that reads bring several of at once, and small ones between them.
+      const upload = new Uint8Array(4 * 1024 * 1024);
+      for (let i = 0; i < upload.length; i++) upload[i] = (i * 13 + (i >> 11)) & 0xff;
+      const pieces: [number, number][] = [];
+      for (let offset = 0; offset < upload.length;) {
+        const size = Math.min(pieces.length % 5 === 4 ? 100 : 30000, upload.length - offset);
+        pieces.push([offset, size]);
+        offset += size;
+      }
+
+      const hostKey = await generateTestHostKeyEd25519();
+      const server = new Server({
+        hostKeys: [hostKey.parsedKey],
+        algorithms: { cipher: [cipher] },
+      });
+      const kept: [bigint, Uint8Array][] = [];
+      server.on('connection', (conn: Connection) => {
+        conn.on('authentication', (ctx: ServerAuthContext) => ctx.accept());
+        conn.on('error', () => {});
+        conn.on('session', (accept: () => Session | undefined) => {
+          accept()!.on('sftp', (acceptSftp: () => Channel | undefined) => {
+            const channel = acceptSftp()!;
+            const sftp = new SFTP(
+              { protocol: conn.protocol },
+              { type: 'session', incoming: channel.incoming, outgoing: channel.outgoing },
+              { server: true },
+            );
+            (async () => {
+              for await (const chunk of channel.readable) sftp.push(chunk);
+              sftp.push(null);
+            })().catch(() => {});
+            sftp.on('OPEN', (id: number) => sftp.handle(id, new Uint8Array([1])));
+            sftp.on(
+              'WRITE',
+              (id: number, _handle: SFTPHandle, offset: number | bigint, data: Uint8Array) => {
+                kept.push([BigInt(offset), data]);
+                sftp.status(id, STATUS_CODE.OK);
+              },
+            );
+            sftp.on('CLOSE', (id: number) => sftp.status(id, STATUS_CODE.OK));
+          });
+        });
+      });
+      await server.injectTransport(serverEnd);
+
+      const client = new Client();
+      client.on('error', () => {});
+      const ready = new Promise<void>((resolve) => client.on('ready', () => resolve()));
+      await client.connect({
+        transport: clientEnd,
+        username: 'u',
+        password: 'p',
+        hostVerifier: () => true,
+        algorithms: { cipher: [cipher] },
+      });
+      await ready;
+
+      const sftp = await client.sftp();
+      const handle = await sftp.open('/upload', 'w');
+      await Promise.all(
+        pieces.map(([offset, size]) => sftp.write(handle, upload, offset, size, offset)),
+      );
+      await sftp.close(handle);
+
+      // Every WRITE's data, held since it arrived, still holds what was sent.
+      const got = new Uint8Array(upload.length);
+      for (const [offset, data] of kept) got.set(data, Number(offset));
+      assertEquals(kept.length, pieces.length);
+      assertEquals(got, upload);
+      client.end();
+      server.close();
+    },
+  });
+}

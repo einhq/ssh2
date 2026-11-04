@@ -659,7 +659,10 @@ import { Client, generateKeyPair, parseKey, Server } from 'jsr:@ein/ssh2-ts';
 
 - **shell**(accept, reject) - Client wants an interactive shell.
 
-- **sftp**(accept, reject) - Client wants an SFTP session.
+- **sftp**(accept, reject) - Client wants an SFTP session. The SFTP server built on its channel
+  emits one event per request (`OPEN`, `READ`, `WRITE`, …). A `WRITE`'s `data` belongs to the
+  listener: ssh2-ts never reuses that buffer, so it can be kept until the bytes are written, without
+  a copy.
 
 - **pty**(accept, reject, info) - Client wants a pseudo-TTY. `info` contains `term`, `cols`, `rows`,
   `width`, `height`, `modes`.
