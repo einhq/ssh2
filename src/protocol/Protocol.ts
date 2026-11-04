@@ -1717,6 +1717,20 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
     }
   }
 
+  /**
+   * Settles once every packet sent so far has been handed to onWrite, or is
+   * undefined when they all have been: a cipher may seal them asynchronously.
+   */
+  outboundWritten(): Promise<void> | undefined {
+    if (
+      !this._sendingPacket && this._outboundPackets.length === 0 &&
+      this._pendingEncryptions.size === 0
+    ) {
+      return undefined;
+    }
+    return this._waitForOutboundPackets();
+  }
+
   private async _waitForOutboundPackets(): Promise<void> {
     while (
       this._sendingPacket || this._outboundPackets.length > 0 || this._pendingEncryptions.size > 0

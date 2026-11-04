@@ -1,6 +1,7 @@
 import { assertEquals, assertStrictEquals, assertThrows } from '@std/assert';
 import type { Transport } from '../src/adapters/types.ts';
 import { Client } from '../src/client.ts';
+import type { Protocol } from '../src/protocol/Protocol.ts';
 import { type Connection, Server, type ServerAuthContext } from '../src/server.ts';
 import { coalesceTransportWrite } from '../src/utils/transport-write.ts';
 import { generateTestHostKeyEd25519 } from './integration_helpers.ts';
@@ -98,5 +99,57 @@ Deno.test({
     client.end();
     server.close();
     assertEquals([clientEnd.writers, serverEnd.writers], [1, 1]);
+  },
+});
+
+Deno.test({
+  name:
+    'client.end() closes the transport once a DISCONNECT sealed behind a large packet is written',
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const toServer = new TransformStream<Uint8Array, Uint8Array>();
+    const toClient = new TransformStream<Uint8Array, Uint8Array>();
+    const clientEnd = new CountingTransport(toClient.readable, toServer.writable);
+    const serverEnd = new CountingTransport(toServer.readable, toClient.writable);
+
+    const hostKey = await generateTestHostKeyEd25519();
+    const disconnected = Promise.withResolvers<void>();
+    const server = new Server({
+      hostKeys: [hostKey.parsedKey],
+      debug: (msg) => {
+        if (msg.includes('Inbound: Received DISCONNECT')) disconnected.resolve();
+      },
+    });
+    server.on('connection', (conn: Connection) => {
+      conn.on('authentication', (ctx: ServerAuthContext) => ctx.accept());
+      conn.on('error', () => {});
+    });
+    await server.injectTransport(serverEnd);
+
+    const client = new Client();
+    client.on('error', () => {});
+    const ready = new Promise<void>((resolve) => client.on('ready', () => resolve()));
+    await client.connect({
+      transport: clientEnd,
+      username: 'u',
+      password: 'p',
+      hostVerifier: () => true,
+    });
+    await ready;
+
+    const protocol = (client as unknown as { _protocol: Protocol })._protocol;
+    assertEquals(protocol.outboundWritten(), undefined);
+    // A large packet is sealed on the cipher's thread, and the DISCONNECT after it too.
+    protocol.channelData(0, new Uint8Array(30000));
+    client.end();
+    assertEquals(clientEnd.closed, false);
+    await disconnected.promise;
+    // The transport closes once the write that carried it completes.
+    for (let i = 0; i < 100 && !clientEnd.closed; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assertEquals(clientEnd.closed, true);
+    server.close();
   },
 });

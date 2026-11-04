@@ -1410,12 +1410,18 @@ export class Connection extends EventEmitter<ConnectionEvents> {
    */
   end(): this {
     this._protocol.disconnect(DISCONNECT_REASON.BY_APPLICATION);
-    this._closing = true;
-    // If no write is in progress, close immediately; otherwise _processWriteQueue will close
-    if (!this._writeInProgress) {
-      this._releaseWriter();
-      this._transport.close();
-    }
+    const close = () => {
+      this._closing = true;
+      // If no write is in progress, close immediately; otherwise _processWriteQueue will close
+      if (!this._writeInProgress) {
+        this._releaseWriter();
+        this._transport.close();
+      }
+    };
+    // The DISCONNECT may still be being sealed behind a bulk transfer's packets.
+    const sealing = this._protocol.outboundWritten();
+    if (sealing) sealing.then(close, close);
+    else close();
     return this;
   }
 

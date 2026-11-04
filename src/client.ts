@@ -1731,12 +1731,16 @@ export class Client extends EventEmitter<ClientEvents> {
     this._clearTimers();
     this._cleanup(new Error('Connection closed'));
 
+    let sealing: Promise<void> | undefined;
     if (this._protocol) {
       this._protocol.disconnect(DISCONNECT_REASON.BY_APPLICATION);
+      // The DISCONNECT may still be being sealed behind a bulk transfer's packets.
+      sealing = this._protocol.outboundWritten();
       this._protocol = undefined;
     }
 
-    if (this._transport) {
+    const close = () => {
+      if (!this._transport) return;
       this._closing = true;
       // If no write is in progress, close immediately; otherwise _processWriteQueue will close
       if (!this._writeInProgress) {
@@ -1744,7 +1748,9 @@ export class Client extends EventEmitter<ClientEvents> {
         this._transport.close();
         this._transport = undefined;
       }
-    }
+    };
+    if (sealing) sealing.then(close, close);
+    else close();
   }
 
   private _closing = false;
