@@ -1,5 +1,9 @@
 import { assertEquals, assertStrictEquals, assertThrows } from '@std/assert';
+import type { Transport } from '../src/adapters/types.ts';
+import { Client } from '../src/client.ts';
+import { type Connection, Server, type ServerAuthContext } from '../src/server.ts';
 import { coalesceTransportWrite } from '../src/utils/transport-write.ts';
+import { generateTestHostKeyEd25519 } from './integration_helpers.ts';
 
 Deno.test('coalesceTransportWrite returns a lone record without copying', () => {
   const record = new Uint8Array([1, 2, 3]);
@@ -32,4 +36,67 @@ Deno.test('coalesceTransportWrite permits one record larger than the bound', () 
   assertStrictEquals(result.data, record);
   assertEquals(result.nextIndex, 1);
   assertThrows(() => coalesceTransportWrite([record], 1, 8), RangeError);
+});
+
+/** One end of an in-memory connection, counting the writers taken on its writable. */
+class CountingTransport implements Transport {
+  writers = 0;
+  closed = false;
+
+  constructor(
+    readonly readable: ReadableStream<Uint8Array>,
+    private _writable: WritableStream<Uint8Array>,
+  ) {}
+
+  get writable(): WritableStream<Uint8Array> {
+    const writable = this._writable;
+    return {
+      getWriter: () => {
+        this.writers++;
+        return writable.getWriter();
+      },
+    } as WritableStream<Uint8Array>;
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this._writable.close().catch(() => {});
+  }
+}
+
+Deno.test({
+  name:
+    'client and server each take the transport writer once for a connection, injected on the server',
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const toServer = new TransformStream<Uint8Array, Uint8Array>();
+    const toClient = new TransformStream<Uint8Array, Uint8Array>();
+    const clientEnd = new CountingTransport(toClient.readable, toServer.writable);
+    const serverEnd = new CountingTransport(toServer.readable, toClient.writable);
+
+    const hostKey = await generateTestHostKeyEd25519();
+    const server = new Server({ hostKeys: [hostKey.parsedKey] });
+    server.on('connection', (conn: Connection) => {
+      conn.on('authentication', (ctx: ServerAuthContext) => ctx.accept());
+      conn.on('error', () => {});
+    });
+    await server.injectTransport(serverEnd);
+
+    const client = new Client();
+    client.on('error', () => {});
+    const ready = new Promise<void>((resolve) => client.on('ready', () => resolve()));
+    await client.connect({
+      transport: clientEnd,
+      username: 'u',
+      password: 'p',
+      hostVerifier: () => true,
+    });
+    await ready;
+
+    client.end();
+    server.close();
+    assertEquals([clientEnd.writers, serverEnd.writers], [1, 1]);
+  },
 });

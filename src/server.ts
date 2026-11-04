@@ -1310,6 +1310,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
   /** Write queue for sequential writes */
   private _writeQueue: Uint8Array[] = [];
   private _writeInProgress = false;
+  /** The transport's writer, held for the connection's life rather than taken per write. */
+  private _writer: WritableStreamDefaultWriter<Uint8Array> | undefined;
 
   /**
    * Write data to transport (queued for sequential writes)
@@ -1329,10 +1331,9 @@ export class Connection extends EventEmitter<ConnectionEvents> {
     }
 
     this._writeInProgress = true;
-    let writer: WritableStreamDefaultWriter<Uint8Array> | undefined;
 
     try {
-      writer = this._transport.writable.getWriter();
+      const writer = this._writer ??= this._transport.writable.getWriter();
 
       for (let i = 0; i < this._writeQueue.length;) {
         const { data, nextIndex } = coalesceTransportWrite(this._writeQueue, i);
@@ -1343,19 +1344,24 @@ export class Connection extends EventEmitter<ConnectionEvents> {
     } catch (err) {
       // Clear the queue to prevent infinite recursion when transport is closed
       this._writeQueue.length = 0;
+      this._releaseWriter();
       // A write cut short by closing the transport is the end of the connection
       if (!this._transport.closed) this.emit('error', err as Error);
     } finally {
-      // Always release the writer lock, even on error
-      writer?.releaseLock();
       this._writeInProgress = false;
       // Check if more data arrived while we were processing
       if (this._writeQueue.length > 0) {
         this._processWriteQueue();
       } else if (this._closing) {
+        this._releaseWriter();
         this._transport.close();
       }
     }
+  }
+
+  private _releaseWriter(): void {
+    this._writer?.releaseLock();
+    this._writer = undefined;
   }
 
   /**
@@ -1407,6 +1413,7 @@ export class Connection extends EventEmitter<ConnectionEvents> {
     this._closing = true;
     // If no write is in progress, close immediately; otherwise _processWriteQueue will close
     if (!this._writeInProgress) {
+      this._releaseWriter();
       this._transport.close();
     }
     return this;
