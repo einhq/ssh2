@@ -25,7 +25,7 @@ import { createCipheriv } from 'node:crypto';
 import { readUInt32BE, writeUInt32BE } from '../utils/binary.ts';
 import type { Cipher, CipherConfig, Decipher, DecipherConfig } from './ciphers.ts';
 import { CHACHAPOLY_WASM } from './chachapoly-wasm.ts';
-import { batchBuffer, openOnThread, sealOnThread } from './chachapoly-thread.ts';
+import { batchBuffer, type InPlace, openOnThread, sealOnThread } from './chachapoly-thread.ts';
 import { randomFill } from './random.ts';
 import { timingSafeEqual } from './utils.ts';
 
@@ -317,16 +317,24 @@ export class ChaChaPolyCipher implements Cipher {
   }
 }
 
+/** The shared memory a view lies in, if it does. */
+const sharedBuffer = (view: Uint8Array): SharedArrayBuffer | undefined =>
+  view.buffer instanceof SharedArrayBuffer ? view.buffer : undefined;
+
 /** Payload callback type that supports both sync and async returns */
 type PayloadCallback = (
   payload: Uint8Array,
 ) => void | boolean | number | Promise<void | boolean | number>;
 
-/** Inbound records on their way to the worker thread, back to back in `buf`. */
+/**
+ * Inbound records on their way to the worker thread: those copied, back to
+ * back in `buf`, then those opened where they were read, in `shared`.
+ */
 interface InBatch {
-  buf: ArrayBuffer;
-  bytes: Uint8Array;
+  buf?: ArrayBuffer;
+  bytes?: Uint8Array;
   used: number;
+  shared?: InPlace;
   /** Sequence number of the first record. */
   seqno: number;
   /** Where each record ends in the data decrypt() was given. */
@@ -341,9 +349,12 @@ interface InBatch {
  *
  * A packet of THREAD_MIN bytes or more is opened on the worker thread instead,
  * together with the others of its size in the same decrypt() call: its record
- * is added to a batch, straight from the data when all of it is there. The
- * batch is opened, and its payloads delivered, before a smaller packet is
- * handled and before decrypt() returns, so packets keep their order. When a
+ * is added to a batch. A record all of which is in data that a transport read
+ * into shared memory (transport-read.ts) is opened there, a run of them
+ * without a copy; any other is copied into the batch, from the data when all
+ * of it is there. The batch is opened, and its payloads delivered, before a
+ * smaller packet is handled and before decrypt() returns, so packets keep
+ * their order, and the data is not read after decrypt() returns. When a
  * handler stops the decipher, the batch's later payloads, opened under the old
  * keys, are dropped, and decrypt() returns where the stopping record ended. A bulk
  * transfer's transport reads are paced so that each brings many packets
@@ -486,8 +497,10 @@ export class ChaChaPolyDecipher implements Decipher {
 
   /**
    * Adds a record ending at `end` in the data, given whole or as its packet and
-   * its MAC, to the batch. A full batch is opened first; what decrypt() is to
-   * return if that stopped the decipher is returned.
+   * its MAC, to the batch: where it lies, if it is whole in shared memory right
+   * after the batch's run there, or else copied. A batch that cannot take it
+   * so is opened first; what decrypt() is to return if that stopped the
+   * decipher is returned.
    */
   private async _add(
     end: number,
@@ -495,20 +508,31 @@ export class ChaChaPolyDecipher implements Decipher {
     tag?: Uint8Array,
   ): Promise<void | boolean | number> {
     const size = record.length + (tag?.length ?? 0);
-    if (this._batch && this._batch.used + size > this._batch.bytes.length) {
+    const shared = tag ? undefined : sharedBuffer(record);
+    const batch = this._batch;
+    if (
+      batch &&
+      (shared
+        ? batch.shared && (batch.shared.buffer !== shared || batch.shared.to !== record.byteOffset)
+        : batch.shared || (batch.bytes && batch.used + size > batch.bytes.length))
+    ) {
       const stopped = await this._flush();
       if (stopped !== undefined) return stopped;
     }
-    let batch = this._batch;
-    if (!batch) {
-      const buf = batchBuffer(size);
-      batch = { buf, bytes: new Uint8Array(buf), used: 0, seqno: this.inSeqno, ends: [] };
-      this._batch = batch;
+    const into = this._batch ??= { used: 0, seqno: this.inSeqno, ends: [] };
+    into.ends.push(end);
+    if (shared) {
+      if (into.shared) into.shared.to += size;
+      else into.shared = { buffer: shared, from: record.byteOffset, to: record.byteOffset + size };
+      return;
     }
-    batch.bytes.set(record, batch.used);
-    if (tag) batch.bytes.set(tag, batch.used + record.length);
-    batch.used += size;
-    batch.ends.push(end);
+    if (!into.bytes) {
+      into.buf = batchBuffer(size);
+      into.bytes = new Uint8Array(into.buf);
+    }
+    into.bytes.set(record, into.used);
+    if (tag) into.bytes.set(tag, into.used + record.length);
+    into.used += size;
   }
 
   /**
@@ -519,7 +543,13 @@ export class ChaChaPolyDecipher implements Decipher {
     const batch = this._batch;
     if (!batch) return;
     this._batch = undefined;
-    const { out, lens, error } = await openOnThread(this._key, batch.seqno, batch.buf, batch.used);
+    const { out, lens, error } = await openOnThread(
+      this._key,
+      batch.seqno,
+      batch.buf,
+      batch.used,
+      batch.shared,
+    );
     let offset = 0;
     for (let i = 0; i < lens.length; i++) {
       if (this._dead) return;

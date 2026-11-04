@@ -407,14 +407,16 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
 
     // Check for SSH-2.0 identifier
     if (lineStr.startsWith('SSH-2.0-') || lineStr.startsWith('SSH-1.99-')) {
-      this._remoteIdentRaw = line.slice();
+      // A copy: the line lies in the transport's read buffer, which is reused.
+      const identRaw = line.slice();
+      this._remoteIdentRaw = identRaw;
       this._debug?.(`Remote ident: ${lineStr}`);
 
       // Parse the header
       const parts = lineStr.split(' ');
       const protoSoft = parts[0].split('-');
       const header: ProtocolHeader = {
-        identRaw: line,
+        identRaw,
         versions: {
           protocol: protoSoft[1],
           software: protoSoft.slice(2).join('-'),

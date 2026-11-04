@@ -29,15 +29,20 @@ const MAX_SPARE = 8;
 /**
  * A request to the worker. Packets lie back to back in `buf`, `used` bytes of
  * it: to be sealed, packets as allocPacket() lays them out; to be opened, the
- * records as they arrived, each its encrypted length, packet and MAC.
+ * records as they arrived, each its encrypted length, packet and MAC. Records
+ * to be opened can also lie in `shared`, from `from` to `to`, after those in
+ * `buf`: the memory a transport read them into, opened where they are.
  */
 interface BatchRequest {
   op: 'seal' | 'open';
   seq: number;
   key: Uint8Array;
   seqno: number;
-  buf: ArrayBuffer;
+  buf?: ArrayBuffer;
   used: number;
+  shared?: SharedArrayBuffer;
+  from?: number;
+  to?: number;
 }
 
 interface InitRequest {
@@ -48,7 +53,7 @@ interface InitRequest {
 interface BatchReply {
   seq: number;
   /** The request's buffer, handed back to be filled again. */
-  buf: ArrayBuffer;
+  buf?: ArrayBuffer;
   /** The sealed records, or the opened payloads, back to back. */
   out: ArrayBuffer;
   /** Opened: each payload's length. */
@@ -140,31 +145,35 @@ function chachaPolyWorker(createCipheriv: typeof import('node:crypto').createCip
     return out;
   };
 
-  const open = (src: Uint8Array, seqno: number) => {
-    const out = new Uint8Array(new ArrayBuffer(src.length));
+  const open = (srcs: Uint8Array[], seqno: number) => {
+    let size = 0;
+    for (const src of srcs) size += src.length;
+    const out = new Uint8Array(new ArrayBuffer(size));
     const lens: number[] = [];
     let w = 0;
-    for (let o = 0; o < src.length; seqno = (seqno + 1) >>> 0) {
-      begin(seqno);
-      mem.set(src.subarray(o, o + 4), PACKET);
-      wasm.chacha20(KEY_LEN, NONCE, 0, PACKET, 4);
-      const len = readU32(mem, PACKET);
-      const pktLen = len + 4;
-      reserve(pktLen + 16);
-      mem.set(src.subarray(o, o + pktLen), PACKET);
-      wasm.poly1305(POLY_KEY, PACKET, pktLen, PACKET + pktLen);
-      let diff = 0;
-      for (let i = 0; i < 16; i++) diff |= mem[PACKET + pktLen + i] ^ src[o + pktLen + i];
-      if (diff !== 0) return { out, lens, error: 'Invalid MAC' };
-      // Packets come here from THREAD_MIN (chacha20.ts) bytes on, all native-sized.
-      const plain = native(src.subarray(o + 4, o + pktLen));
-      const padLen = plain[0];
-      if (padLen > len - 1) return { out, lens, error: 'Invalid padding length' };
-      const payloadLen = len - 1 - padLen;
-      out.set(plain.subarray(1, 1 + payloadLen), w);
-      w += payloadLen;
-      lens.push(payloadLen);
-      o += pktLen + 16;
+    for (const src of srcs) {
+      for (let o = 0; o < src.length; seqno = (seqno + 1) >>> 0) {
+        begin(seqno);
+        mem.set(src.subarray(o, o + 4), PACKET);
+        wasm.chacha20(KEY_LEN, NONCE, 0, PACKET, 4);
+        const len = readU32(mem, PACKET);
+        const pktLen = len + 4;
+        reserve(pktLen + 16);
+        mem.set(src.subarray(o, o + pktLen), PACKET);
+        wasm.poly1305(POLY_KEY, PACKET, pktLen, PACKET + pktLen);
+        let diff = 0;
+        for (let i = 0; i < 16; i++) diff |= mem[PACKET + pktLen + i] ^ src[o + pktLen + i];
+        if (diff !== 0) return { out, lens, error: 'Invalid MAC' };
+        // Packets come here from THREAD_MIN (chacha20.ts) bytes on, all native-sized.
+        const plain = native(src.subarray(o + 4, o + pktLen));
+        const padLen = plain[0];
+        if (padLen > len - 1) return { out, lens, error: 'Invalid padding length' };
+        const payloadLen = len - 1 - padLen;
+        out.set(plain.subarray(1, 1 + payloadLen), w);
+        w += payloadLen;
+        lens.push(payloadLen);
+        o += pktLen + 16;
+      }
     }
     return { out, lens };
   };
@@ -179,17 +188,20 @@ function chachaPolyWorker(createCipheriv: typeof import('node:crypto').createCip
     }
     mem.set(data.key.subarray(0, 64), KEY_MAIN);
     keyMain.set(data.key.subarray(0, 32));
-    const src = new Uint8Array(data.buf, 0, data.used);
+    const buf = data.buf;
     if (data.op === 'seal') {
-      const out = seal(src, data.seqno);
-      scope.postMessage({ seq: data.seq, buf: data.buf, out: out.buffer }, [data.buf, out.buffer]);
+      const out = seal(new Uint8Array(buf!, 0, data.used), data.seqno);
+      scope.postMessage({ seq: data.seq, buf, out: out.buffer }, [buf!, out.buffer]);
       return;
     }
-    const { out, lens, error } = open(src, data.seqno);
-    scope.postMessage({ seq: data.seq, buf: data.buf, out: out.buffer, lens, error }, [
-      data.buf,
-      out.buffer,
-    ]);
+    const srcs: Uint8Array[] = [];
+    if (buf) srcs.push(new Uint8Array(buf, 0, data.used));
+    if (data.shared) srcs.push(new Uint8Array(data.shared, data.from, data.to! - data.from!));
+    const { out, lens, error } = open(srcs, data.seqno);
+    scope.postMessage(
+      { seq: data.seq, buf, out: out.buffer, lens, error },
+      buf ? [buf, out.buffer] : [out.buffer],
+    );
   };
 }
 
@@ -247,7 +259,7 @@ const startedThread = (): Thread => {
   const worker = new Worker(workerUrl, { type: 'module' });
   const started: Thread = { worker, replies: new Map(), idleSince: performance.now() };
   worker.onmessage = ({ data }: MessageEvent<BatchReply>) => {
-    if (spare.length < MAX_SPARE) spare.push(data.buf);
+    if (data.buf && spare.length < MAX_SPARE) spare.push(data.buf);
     const reply = started.replies.get(data.seq);
     if (!reply) return;
     started.replies.delete(data.seq);
@@ -267,16 +279,28 @@ const request = (
   op: BatchRequest['op'],
   key: Uint8Array,
   seqno: number,
-  buf: ArrayBuffer,
+  buf: ArrayBuffer | undefined,
   used: number,
+  shared?: InPlace,
 ): Promise<BatchReply> => {
   const owner = startedThread();
   const seq = nextSeq++;
   const { promise, resolve, reject } = Promise.withResolvers<BatchReply>();
   owner.replies.set(seq, { resolve, reject });
-  owner.worker.postMessage({ op, seq, key, seqno, buf, used } satisfies BatchRequest, [
-    buf,
-  ]);
+  owner.worker.postMessage(
+    {
+      op,
+      seq,
+      key,
+      seqno,
+      buf,
+      used,
+      shared: shared?.buffer,
+      from: shared?.from,
+      to: shared?.to,
+    } satisfies BatchRequest,
+    buf ? [buf] : [],
+  );
   return promise;
 };
 
@@ -310,17 +334,26 @@ export interface Opened {
   error?: string;
 }
 
+/** Records back to back in shared memory, from `from` to `to`. */
+export interface InPlace {
+  buffer: SharedArrayBuffer;
+  from: number;
+  to: number;
+}
+
 /**
  * Opens the records in the first `used` bytes of `buf`, which is handed over,
- * the first under `seqno`. Payloads are opened until one fails its MAC or
- * padding check.
+ * then those `shared` holds, the first under `seqno`. The shared memory is read
+ * until the promise settles, and must not change before. Payloads are opened
+ * until one fails its MAC or padding check.
  */
 export async function openOnThread(
   key: Uint8Array,
   seqno: number,
-  buf: ArrayBuffer,
+  buf: ArrayBuffer | undefined,
   used: number,
+  shared?: InPlace,
 ): Promise<Opened> {
-  const { out, lens, error } = await request('open', key, seqno, buf, used);
+  const { out, lens, error } = await request('open', key, seqno, buf, used, shared);
   return { out, lens: lens!, error };
 }

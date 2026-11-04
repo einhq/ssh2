@@ -1,6 +1,10 @@
 import type { Transport } from '../adapters/types.ts';
 
-/** The buffer a transport with `read` is read into, reused for every chunk. */
+/**
+ * The buffer a transport with `read` is read into, reused for every chunk. It
+ * is shared memory, so that the decipher's worker can open the packets where
+ * they were read (chacha20.ts).
+ */
 export const READ_BUFFER = 256 * 1024;
 
 /**
@@ -21,8 +25,9 @@ export const PACE_MS = 1;
 
 /**
  * The chunks a transport delivers, in order, until it ends. Through `read`
- * they are views of one buffer, each valid until the next is asked for; a
- * read that fills the buffer is followed by the next at once, as more waits.
+ * they are views of one buffer of shared memory, each valid until the next is
+ * asked for; a read that fills the buffer is followed by the next at once, as
+ * more waits.
  *
  * `bulk` is told true when a bulk transfer's chunk is handed on, and false
  * just before the next read starts: what the connection writes in between,
@@ -46,7 +51,7 @@ export async function* transportChunks(
     }
   }
 
-  const buf = new Uint8Array(READ_BUFFER);
+  const buf = new Uint8Array(new SharedArrayBuffer(READ_BUFFER));
   try {
     while (true) {
       const n = await transport.read(buf);

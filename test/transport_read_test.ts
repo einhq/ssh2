@@ -1,4 +1,4 @@
-import { assertEquals } from '@std/assert';
+import { assert, assertEquals } from '@std/assert';
 import type { Transport } from '../src/adapters/types.ts';
 import type { Channel } from '../src/Channel.ts';
 import { Client } from '../src/client.ts';
@@ -26,7 +26,7 @@ function sizedTransport(sizes: number[]): Transport {
   };
 }
 
-Deno.test('transportChunks reads into one buffer and reports a bulk transfer around its chunks', async () => {
+Deno.test('transportChunks reads into one shared buffer and reports a bulk transfer around its chunks', async () => {
   const sizes = [10, PACE_MIN, READ_BUFFER, 5];
   const events: string[] = [];
   const buffers = new Set<ArrayBufferLike>();
@@ -37,6 +37,8 @@ Deno.test('transportChunks reads into one buffer and reports a bulk transfer aro
     events.push(`chunk ${chunk.length} of ${chunk[0]}`);
   }
   assertEquals(buffers.size, 1);
+  // Shared, so that the decipher's worker opens packets where they were read.
+  assert([...buffers][0] instanceof SharedArrayBuffer);
   assertEquals(events, [
     'chunk 10 of 0',
     'bulk true',
