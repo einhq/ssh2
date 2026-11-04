@@ -818,7 +818,10 @@ The two features Web Crypto does not cover are provided without any third-party 
 - **`chacha20-poly1305@openssh.com`** transport cipher — ChaCha20 and Poly1305 in WebAssembly
   (`src/crypto/chachapoly.wat`, assembled into `src/crypto/chachapoly-wasm.ts` by
   `deno task build:wasm`), with payloads of 2 KiB and more encrypted by the runtime's native
-  `chacha20` cipher from `node:crypto` (available in Deno 2.9.4+).
+  `chacha20` cipher from `node:crypto` (available in Deno 2.9.4+). Outbound packets with a payload
+  of 2 KiB or more, and those sent while any wait, are sealed in batches on a web Worker shared by
+  every connection in the process (`src/crypto/chachapoly-thread.ts`), so that a download's cipher
+  work leaves the main thread; the Worker stops after 1 s without work.
 - **`bcrypt` KDF** — used when reading or writing passphrase-protected OpenSSH private keys
   (`src/keygen.ts`, `src/protocol/keyParser.ts`); provided by a vendored `bcrypt_pbkdf`
   implementation (`src/crypto/bcrypt-pbkdf.ts`).

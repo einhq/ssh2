@@ -193,26 +193,55 @@ Deno.test('poly1305 leaves the bytes after the message alone', () => {
   }
 });
 
-/** Seals a packet of payloadLen bytes whose padding is filled in deterministically. */
-function seal(seqno: number, payloadLen: number): Uint8Array {
-  const key = Uint8Array.from({ length: 64 }, (_, i) => i);
-  const records: Uint8Array[] = [];
-  const cipher = new ChaChaPolyCipher({
+const SSH_KEY = Uint8Array.from({ length: 64 }, (_, i) => i);
+
+function cipher(seqno: number, records: Uint8Array[]): ChaChaPolyCipher {
+  return new ChaChaPolyCipher({
     outbound: {
       seqno,
       onWrite: (data) => records.push(data),
       cipherInfo: CIPHER_INFO['chacha20-poly1305@openssh.com'],
-      cipherKey: key,
+      cipherKey: SSH_KEY,
       cipherIV: new Uint8Array(0),
     },
   });
-  const packet = cipher.allocPacket(payloadLen);
+}
+
+/** Fills a packet's payload and padding deterministically. */
+function fill(packet: Uint8Array, payloadLen: number): Uint8Array {
   for (let i = 4; i < packet.length; i++) packet[i] = (i * 31) & 0xff;
   packet[4] = packet.length - 5 - payloadLen;
-  cipher.encrypt(packet);
+  return packet;
+}
+
+/** The payload fill() gives a packet of payloadLen bytes. */
+function filledPayload(payloadLen: number): string {
+  const packet = new Uint8Array(4 + 1 + payloadLen + 64);
+  for (let i = 4; i < packet.length; i++) packet[i] = (i * 31) & 0xff;
+  return toHex(packet.subarray(5, 5 + payloadLen));
+}
+
+/** Seals a packet of payloadLen bytes whose padding is filled in deterministically. */
+async function seal(seqno: number, payloadLen: number): Promise<Uint8Array> {
+  const records: Uint8Array[] = [];
+  const c = cipher(seqno, records);
+  const packet = fill(c.allocPacket(payloadLen), payloadLen);
+  // A packet sealed on the thread is handed over: its view is detached after encrypt().
+  const length = packet.length;
+  await c.encrypt(packet);
   assertEquals(records.length, 1);
-  assertEquals(records[0].length, packet.length + 16);
+  assertEquals(records[0].length, length + 16);
   return records[0];
+}
+
+function concat(parts: Uint8Array[]): Uint8Array {
+  const all = new Uint8Array(parts.reduce((n, r) => n + r.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    all.set(part, offset);
+    offset += part.length;
+  }
+  return all;
 }
 
 async function sha256(data: Uint8Array): Promise<string> {
@@ -221,108 +250,149 @@ async function sha256(data: Uint8Array): Promise<string> {
 
 Deno.test('ChaChaPolyCipher seals records as before, small and large', async () => {
   assertEquals(
-    toHex(seal(7, 20)),
+    toHex(await seal(7, 20)),
     'a39afc8a23ddaf9ab6941c0b18fe09212780fd6158399aff96e41bc624e9b91e' +
       '60ac1d69da71e2e86b8a2ec3aadb797eae1214f6',
   );
   assertEquals(
-    await sha256(seal(0xfffffffe, 3000)),
+    await sha256(await seal(0xfffffffe, 3000)),
     '16354c7899d22a7fd521ba5a9be49a3c1dd80368e4da6677cf2d3f82095d996a',
   );
   assertEquals(
-    await sha256(seal(3, 32781)),
+    await sha256(await seal(3, 32781)),
     'f6841e0dadedf8a86076b5aa5b876cb1e04b5009863ec57142f27996c3761158',
   );
 });
 
-function decipher(seqno: number, payloads: Uint8Array[]): ChaChaPolyDecipher {
+Deno.test('ChaChaPolyCipher writes a small packet at once and a large one from the thread', async () => {
+  const records: Uint8Array[] = [];
+  const c = cipher(0, records);
+  assertEquals(c.encrypt(fill(c.allocPacket(20), 20)), undefined);
+  assertEquals(records.length, 1);
+
+  const sealed = c.encrypt(fill(c.allocPacket(32781), 32781));
+  assertEquals(records.length, 1);
+  await sealed;
+  assertEquals(records.length, 2);
+  assertEquals(c.outSeqno, 2);
+});
+
+Deno.test('ChaChaPolyCipher writes packets queued behind the thread in order, in one batch', async () => {
+  const sizes = [32781, 20, 3000, 20, 32781, 1];
+  const expected = concat(await Promise.all(sizes.map((size, i) => seal(40 + i, size))));
+
+  const records: Uint8Array[] = [];
+  const c = cipher(40, records);
+  const results = sizes.map((size) => c.encrypt(fill(c.allocPacket(size), size)));
+  assertEquals(records.length, 0);
+  // The first packet starts a batch and the rest join it.
+  assertEquals(results.map((r) => r instanceof Promise), [true, false, false, false, false, false]);
+  await results[0];
+  assertEquals(records.length, 1);
+  assertEquals(toHex(concat(records)), toHex(expected));
+  assertEquals(c.outSeqno, 40 + sizes.length);
+
+  // Once the batch is written, a small packet is sealed at once again.
+  assertEquals(c.encrypt(fill(c.allocPacket(20), 20)), undefined);
+  assertEquals(toHex(records[1]), toHex(await seal(46, 20)));
+});
+
+Deno.test('ChaChaPolyCipher sends a full batch and keeps filling the next', async () => {
+  // Eight 32 KiB packets fill one 256 KiB batch; the rest start another.
+  const count = 20;
+  const expected = concat(
+    await Promise.all(Array.from({ length: count }, (_, i) => seal(i, 32781))),
+  );
+  const records: Uint8Array[] = [];
+  const c = cipher(0, records);
+  const pending: Promise<void>[] = [];
+  for (let i = 0; i < count; i++) {
+    const sealed = c.encrypt(fill(c.allocPacket(32781), 32781));
+    if (sealed) pending.push(sealed);
+  }
+  assertEquals(pending.length > 1, true);
+  await Promise.all(pending);
+  assertEquals(toHex(concat(records)), toHex(expected));
+});
+
+Deno.test('ChaChaPolyCipher writes nothing once freed', async () => {
+  const records: Uint8Array[] = [];
+  const c = cipher(0, records);
+  const sealed = c.encrypt(fill(c.allocPacket(32781), 32781));
+  c.free();
+  await sealed;
+  assertEquals(records.length, 0);
+});
+
+function decipher(
+  seqno: number,
+  payloads: Uint8Array[],
+  stopAt?: number,
+): ChaChaPolyDecipher {
   return new ChaChaPolyDecipher({
     inbound: {
       seqno,
       onPayload: (payload) => {
         payloads.push(payload);
+        if (payloads.length === stopAt) return false;
       },
       decipherInfo: CIPHER_INFO['chacha20-poly1305@openssh.com'],
-      decipherKey: Uint8Array.from({ length: 64 }, (_, i) => i),
+      decipherKey: SSH_KEY,
       decipherIV: new Uint8Array(0),
     },
   });
 }
 
 Deno.test('ChaChaPolyDecipher opens records fed whole, in pieces, and back to back', async () => {
-  const sizes = [20, 3000, 32781];
-  const records = sizes.map((size, i) => seal(100 + i, size));
-  const expected = sizes.map((size) => {
-    const packet = new Uint8Array(4 + 1 + size + 64);
-    for (let i = 4; i < packet.length; i++) packet[i] = (i * 31) & 0xff;
-    return toHex(packet.subarray(5, 5 + size));
-  });
+  const sizes = [20, 3000, 32781, 20, 32781, 32781, 1];
+  const records = await Promise.all(sizes.map((size, i) => seal(100 + i, size)));
+  const expected = sizes.map(filledPayload);
+  const all = concat(records);
 
-  for (const piece of [Infinity, 1, 3, 4, 7, 4097]) {
-    const all = new Uint8Array(records.reduce((n, r) => n + r.length, 0));
-    let offset = 0;
-    for (const record of records) {
-      all.set(record, offset);
-      offset += record.length;
-    }
+  for (const piece of [Infinity, 1, 3, 4, 7, 4097, 65536]) {
     const payloads: Uint8Array[] = [];
     const d = decipher(100, payloads);
     for (let p = 0; p < all.length; p += piece) {
       const chunk = all.subarray(p, Math.min(all.length, p + piece));
-      await d.decrypt(chunk, 0, chunk.length);
+      assertEquals(await d.decrypt(chunk, 0, chunk.length), undefined);
     }
     assertEquals(payloads.map(toHex), expected, `pieces of ${piece}`);
-    assertEquals(d.inSeqno, 103);
+    assertEquals(d.inSeqno, 100 + sizes.length);
   }
 });
 
-Deno.test('ChaChaPolyCipher seals a packet it did not allocate the same way', () => {
-  for (const size of [20, 3000, 32781]) {
-    const records: Uint8Array[] = [];
-    const cipher = new ChaChaPolyCipher({
-      outbound: {
-        seqno: 3,
-        onWrite: (data) => records.push(data),
-        cipherInfo: CIPHER_INFO['chacha20-poly1305@openssh.com'],
-        cipherKey: Uint8Array.from({ length: 64 }, (_, i) => i),
-        cipherIV: new Uint8Array(0),
-      },
-    });
-    const sealed = seal(3, size);
-    const packet = new Uint8Array(sealed.length - 16);
-    packet.set(cipher.allocPacket(size).subarray(0, 4));
-    for (let i = 4; i < packet.length; i++) packet[i] = (i * 31) & 0xff;
-    packet[4] = packet.length - 5 - size;
-    cipher.encrypt(packet);
-    assertEquals(toHex(records[0]), toHex(sealed), `${size} bytes`);
-  }
-});
+Deno.test('ChaChaPolyDecipher stops after the packet whose handler stops it', async () => {
+  // The fourth record is sealed under other keys, as after NEWKEYS.
+  const sizes = [32781, 20, 20];
+  const records = await Promise.all(sizes.map((size, i) => seal(5 + i, size)));
+  const other = await seal(0, 32781);
+  other[0] ^= 0x55;
+  const all = concat([...records, other]);
+  const ends = [records[0].length, records[0].length + records[1].length];
 
-Deno.test('ChaChaPolyCipher hands out records that later packets do not overwrite', () => {
-  for (const size of [20, 32781]) {
-    const records: Uint8Array[] = [];
-    const cipher = new ChaChaPolyCipher({
-      outbound: {
-        seqno: 0,
-        onWrite: (data) => records.push(data),
-        cipherInfo: CIPHER_INFO['chacha20-poly1305@openssh.com'],
-        cipherKey: Uint8Array.from({ length: 64 }, (_, i) => i),
-        cipherIV: new Uint8Array(0),
-      },
-    });
-    cipher.encrypt(cipher.allocPacket(size));
-    const copy = toHex(records[0]);
-    cipher.encrypt(cipher.allocPacket(size));
-    assertEquals(toHex(records[0]), copy, `${size} bytes`);
+  for (const stopAt of [1, 2]) {
+    const payloads: Uint8Array[] = [];
+    const d = decipher(5, payloads, stopAt);
+    assertEquals(await d.decrypt(all, 0, all.length), ends[stopAt - 1], `stop at ${stopAt}`);
+    assertEquals(payloads.map(toHex), sizes.slice(0, stopAt).map(filledPayload));
+    assertEquals(d.inSeqno, 5 + stopAt);
   }
+
+  // Not stopped, the record under other keys fails after the others are handed on.
+  const payloads: Uint8Array[] = [];
+  await assertRejects(
+    () => decipher(5, payloads).decrypt(all, 0, all.length),
+    Error,
+  );
+  assertEquals(payloads.length, 3);
 });
 
 Deno.test('ChaChaPolyDecipher hands out payloads that later packets do not overwrite', async () => {
   for (const size of [20, 3000, 32781]) {
     const payloads: Uint8Array[] = [];
     const d = decipher(7, payloads);
-    const first = seal(7, size);
-    const second = seal(8, size);
+    const first = await seal(7, size);
+    const second = await seal(8, size);
     await d.decrypt(first, 0, first.length);
     const copy = toHex(payloads[0]);
     await d.decrypt(second, 0, second.length);
@@ -332,12 +402,16 @@ Deno.test('ChaChaPolyDecipher hands out payloads that later packets do not overw
 });
 
 Deno.test('ChaChaPolyDecipher rejects a record with a flipped bit', async () => {
-  const cases: [number, string][] = [[0, 'Bad packet length'], [10, 'Invalid MAC'], [
-    3020,
-    'Invalid MAC',
-  ]];
-  for (const [at, message] of cases) {
-    const record = seal(0xfffffffe, 3000);
+  const cases: [number, number, string][] = [
+    [20, 0, 'Bad packet length'],
+    [20, 10, 'Invalid MAC'],
+    [20, 40, 'Invalid MAC'],
+    [3000, 0, 'Bad packet length'],
+    [3000, 10, 'Invalid MAC'],
+    [3000, 3020, 'Invalid MAC'],
+  ];
+  for (const [size, at, message] of cases) {
+    const record = await seal(0xfffffffe, size);
     record[at] ^= 1;
     await assertRejects(
       () => decipher(0xfffffffe, []).decrypt(record, 0, record.length),
@@ -347,7 +421,43 @@ Deno.test('ChaChaPolyDecipher rejects a record with a flipped bit', async () => 
   }
 });
 
-Deno.test('ChaChaPolyCipher leaves no native cipher context behind', () => {
+Deno.test('ChaChaPolyDecipher hands on the payloads before a record that fails', async () => {
+  const records = await Promise.all([32781, 20, 32781].map((size, i) => seal(i, size)));
+  records[2][100] ^= 1;
+  const all = concat(records);
+  const payloads: Uint8Array[] = [];
+  await assertRejects(
+    () => decipher(0, payloads).decrypt(all, 0, all.length),
+    Error,
+    'Invalid MAC',
+  );
+  assertEquals(payloads.map(toHex), [32781, 20].map(filledPayload));
+});
+
+Deno.test('ChaChaPolyCipher seals a packet it did not allocate the same way', async () => {
+  for (const size of [20, 3000, 32781]) {
+    const records: Uint8Array[] = [];
+    const c = cipher(3, records);
+    const sealed = await seal(3, size);
+    const packet = new Uint8Array(sealed.length - 16);
+    packet.set(c.allocPacket(size).subarray(0, 4));
+    await c.encrypt(fill(packet, size));
+    assertEquals(toHex(records[0]), toHex(sealed), `${size} bytes`);
+  }
+});
+
+Deno.test('ChaChaPolyCipher hands out records that later packets do not overwrite', async () => {
+  for (const size of [20, 32781]) {
+    const records: Uint8Array[] = [];
+    const c = cipher(0, records);
+    await c.encrypt(c.allocPacket(size));
+    const copy = toHex(records[0]);
+    await c.encrypt(c.allocPacket(size));
+    assertEquals(toHex(records[0]), copy, `${size} bytes`);
+  }
+});
+
+Deno.test('ChaChaPolyDecipher leaves no native cipher context behind', async () => {
   // An unfinalized node:crypto cipher shows only in the runtime's internal
   // resource table; the test sanitizers do not see it.
   type Internal = { core: { resources(): Record<string, string> } };
@@ -356,7 +466,9 @@ Deno.test('ChaChaPolyCipher leaves no native cipher context behind', () => {
   const ciphers = () =>
     Object.values(core.resources()).filter((name) => name === 'cryptoCipher').length;
 
+  const records = await Promise.all(Array.from({ length: 10 }, (_, i) => seal(i, 32781)));
   const before = ciphers();
-  for (let i = 0; i < 10; i++) seal(i, 32781);
+  const d = decipher(0, []);
+  for (const record of records) await d.decrypt(record, 0, record.length);
   assertEquals(ciphers(), before);
 });

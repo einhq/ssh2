@@ -15,12 +15,19 @@
  * A packet is copied as little as it can be: an outbound one is filled where
  * it is encrypted, and an inbound payload that went through the native
  * cipher is handed on as a view of the native output.
+ *
+ * Outbound packets with a payload of THREAD_MIN bytes or more, and those that
+ * queue behind them, are sealed on a worker thread instead
+ * (chachapoly-thread.ts), in batches, so that a download's cipher work leaves
+ * the calling thread. Inbound packets are opened here: a message per socket
+ * read costs about as much main-thread time as opening its packets saves.
  */
 
 import { createCipheriv } from 'node:crypto';
 import { readUInt32BE, writeUInt32BE } from '../utils/binary.ts';
 import type { Cipher, CipherConfig, Decipher, DecipherConfig } from './ciphers.ts';
 import { CHACHAPOLY_WASM } from './chachapoly-wasm.ts';
+import { batchBuffer, sealOnThread } from './chachapoly-thread.ts';
 import { randomFill } from './random.ts';
 import { timingSafeEqual } from './utils.ts';
 
@@ -123,34 +130,69 @@ class ChaChaPoly {
 }
 
 /**
+ * Payload size from which an outbound packet is sealed on the worker thread
+ * even when none of its connection's packets wait there. Smaller ones are
+ * sealed here, where they cost less than a message.
+ */
+const THREAD_MIN = 2048;
+
+/** Outbound packets on their way to the worker thread, back to back in `buf`. */
+interface OutBatch {
+  buf: ArrayBuffer;
+  bytes: Uint8Array;
+  used: number;
+  /** Sequence number of the first packet. */
+  seqno: number;
+  /** Settles once the batch's records are written. */
+  done: PromiseWithResolvers<void>;
+}
+
+/**
  * ChaCha20-Poly1305 Cipher for SSH
  *
  * SSH's chacha20-poly1305@openssh.com uses:
  * - Two 256-bit keys: one for packet length encryption, one for payload
  * - Custom nonce construction using sequence number
  * - Poly1305 MAC over encrypted length + encrypted payload
+ *
+ * A packet with a payload of THREAD_MIN bytes or more, and every packet after
+ * it until the worker thread's batches are written, is sealed on the thread.
+ * Its packets are gathered in a batch while an earlier one is out, so that a
+ * busy connection sends many per message. Records are written in packet order.
  */
 export class ChaChaPolyCipher implements Cipher {
   outSeqno: number;
   private _onWrite: (data: Uint8Array) => void;
   private _state: ChaChaPoly;
+  private _key: Uint8Array;
   private _dead = false;
+  /** The batch packets are added to, until it is sent. */
+  private _batch: OutBatch | undefined;
+  /** Batches sent to the thread whose records are not yet written. */
+  private _sending = 0;
+  /** Settles once the last batch sent is written; each batch writes after the one before. */
+  private _written: Promise<void> = Promise.resolve();
+  private _flushQueued = false;
 
   constructor(config: CipherConfig) {
     const enc = config.outbound;
     this.outSeqno = enc.seqno;
     this._onWrite = enc.onWrite;
     this._state = new ChaChaPoly(enc.cipherKey);
+    this._key = enc.cipherKey.slice(0, 64);
   }
 
   free(): void {
     this._dead = true;
+    // A batch not yet sent is dropped; those sent are not written.
+    this._batch?.done.resolve();
+    this._batch = undefined;
   }
 
   /**
-   * The packet is laid out in the instance's memory, where encrypt() works on
-   * it, so filling it is the payload's only copy. It is valid until the next
-   * allocPacket() or encrypt().
+   * The packet is laid out where encrypt() works on it, in the instance's
+   * memory or in the batch for the thread, so filling it is the payload's only
+   * copy. It is valid until the next allocPacket() or encrypt().
    */
   allocPacket(payloadLen: number): Uint8Array {
     let pktLen = 4 + 1 + payloadLen;
@@ -158,9 +200,15 @@ export class ChaChaPolyCipher implements Cipher {
     if (padLen < 4) padLen += 8;
     pktLen += padLen;
 
-    const state = this._state;
-    state.reserve(pktLen + 16);
-    const packet = state.mem.subarray(PACKET, PACKET + pktLen);
+    let packet: Uint8Array;
+    if (payloadLen >= THREAD_MIN || this._busy()) {
+      const batch = this._room(pktLen);
+      packet = batch.bytes.subarray(batch.used, batch.used + pktLen);
+    } else {
+      const state = this._state;
+      state.reserve(pktLen + 16);
+      packet = state.mem.subarray(PACKET, PACKET + pktLen);
+    }
     writeUInt32BE(packet, pktLen - 4, 0);
     packet[4] = padLen;
     randomFill(packet, 5 + payloadLen, padLen);
@@ -168,9 +216,92 @@ export class ChaChaPolyCipher implements Cipher {
     return packet;
   }
 
-  encrypt(packet: Uint8Array): void {
+  /**
+   * A packet sealed here is written before this returns. One that goes to the
+   * thread returns a promise if it starts a batch, settled once the batch is
+   * written; one that joins a batch returns nothing, as the batch's promise
+   * covers it.
+   */
+  encrypt(packet: Uint8Array): void | Promise<void> {
     if (this._dead) return;
 
+    const len = packet.length;
+    let batch = this._batch;
+    const allocated = batch !== undefined && packet.buffer === batch.buf &&
+      packet.byteOffset === batch.used;
+    if (!allocated && (this._busy() || len >= THREAD_MIN)) {
+      batch = this._room(len);
+      batch.bytes.set(packet, batch.used);
+    } else if (!allocated) {
+      this._seal(packet);
+      return;
+    }
+
+    const first = batch!.used === 0;
+    batch!.used += len;
+    this.outSeqno = (this.outSeqno + 1) >>> 0;
+    if (!this._flushQueued) {
+      // Packets encrypted in the same turn go together.
+      this._flushQueued = true;
+      queueMicrotask(() => {
+        this._flushQueued = false;
+        if (this._sending === 0) this._sendBatch();
+      });
+    }
+    return first ? batch!.done.promise : undefined;
+  }
+
+  /** Whether packets wait on the thread, so that the next one must follow them there. */
+  private _busy(): boolean {
+    return this._sending > 0 || (this._batch !== undefined && this._batch.used > 0);
+  }
+
+  /** The batch with room for a packet of pktLen bytes; a full one is sent. */
+  private _room(pktLen: number): OutBatch {
+    let batch = this._batch;
+    if (batch && batch.used + pktLen > batch.bytes.length) {
+      this._sendBatch();
+      batch = undefined;
+    }
+    if (!batch) {
+      const buf = batchBuffer(pktLen);
+      batch = {
+        buf,
+        bytes: new Uint8Array(buf),
+        used: 0,
+        seqno: this.outSeqno,
+        done: Promise.withResolvers<void>(),
+      };
+      this._batch = batch;
+    }
+    return batch;
+  }
+
+  /** Sends the batch being filled to the thread and queues the write of its records. */
+  private _sendBatch(): void {
+    const batch = this._batch;
+    if (!batch || batch.used === 0) return;
+    this._batch = undefined;
+    this._sending++;
+    const sealed = sealOnThread(this._key, batch.seqno, batch.buf, batch.used);
+    const previous = this._written;
+    this._written = (async () => {
+      try {
+        const records = await sealed;
+        await previous;
+        if (!this._dead) this._onWrite(records);
+        batch.done.resolve();
+      } catch (err) {
+        batch.done.reject(err);
+      } finally {
+        this._sending--;
+        if (this._sending === 0) this._sendBatch();
+      }
+    })();
+  }
+
+  /** Seals a packet here and writes its record. */
+  private _seal(packet: Uint8Array): void {
     const state = this._state;
     const len = packet.length;
     if (packet.buffer !== state.mem.buffer || packet.byteOffset !== PACKET) {
