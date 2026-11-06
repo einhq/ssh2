@@ -24,10 +24,20 @@ export const PACE_MIN = 32 * 1024;
 export const PACE_MS = 1;
 
 /**
+ * How many reads go without the wait after one that did not pay: a wait whose
+ * next read brought less than half the buffer. On a path that hands data over
+ * a segment at a time, such as a user-space network stack (slirp4netns), a
+ * wait per read caps the transfer instead of batching it; after this many
+ * reads the wait is tried again.
+ */
+export const PACE_RETRY = 256;
+
+/**
  * The chunks a transport delivers, in order, until it ends. Through `read`
  * they are views of one buffer of shared memory, each valid until the next is
  * asked for; a read that fills the buffer is followed by the next at once, as
- * more waits.
+ * more waits, and so is a bulk read for PACE_RETRY reads after a wait that did
+ * not pay.
  *
  * `bulk` is told true when a bulk transfer's chunk is handed on, and false
  * just before the next read starts: what the connection writes in between,
@@ -52,14 +62,25 @@ export async function* transportChunks(
   }
 
   const buf = new Uint8Array(new SharedArrayBuffer(READ_BUFFER));
+  let unpaced = 0;
+  let waited = false;
   try {
     while (true) {
       const n = await transport.read(buf);
       if (n === null) return;
+      if (waited && n < buf.length / 2) unpaced = PACE_RETRY;
+      waited = false;
       const busy = n >= PACE_MIN;
       if (busy) bulk?.(true);
       yield buf.subarray(0, n);
-      if (busy && n < buf.length) await new Promise((resolve) => setTimeout(resolve, PACE_MS));
+      if (busy && n < buf.length) {
+        if (unpaced > 0) {
+          unpaced--;
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, PACE_MS));
+          waited = true;
+        }
+      }
       if (busy) bulk?.(false);
     }
   } finally {

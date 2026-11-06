@@ -3,7 +3,7 @@ import type { Transport } from '../src/adapters/types.ts';
 import type { Channel } from '../src/Channel.ts';
 import { Client } from '../src/client.ts';
 import { type Connection, Server, type ServerAuthContext, type Session } from '../src/server.ts';
-import { PACE_MIN, READ_BUFFER, transportChunks } from '../src/utils/transport-read.ts';
+import { PACE_MIN, PACE_RETRY, READ_BUFFER, transportChunks } from '../src/utils/transport-read.ts';
 import { SFTP } from '../src/protocol/sftp/SFTP.ts';
 import { STATUS_CODE } from '../src/protocol/sftp/constants.ts';
 import type { SFTPHandle } from '../src/protocol/sftp/types.ts';
@@ -50,6 +50,29 @@ Deno.test('transportChunks reads into one shared buffer and reports a bulk trans
     'chunk 5 of 3',
     'bulk false',
   ]);
+});
+
+/** How long reading a transport of these read sizes takes, in ms. */
+async function readTime(sizes: number[]): Promise<number> {
+  const start = performance.now();
+  for await (const _ of transportChunks(sizedTransport(sizes))) {
+    // Only the reads' pace is measured.
+  }
+  return performance.now() - start;
+}
+
+Deno.test('a wait that does not let half a buffer arrive is not made again for a while', async () => {
+  // A path that hands each read one segment: every wait would cap the transfer.
+  const reads = PACE_RETRY;
+  const took = await readTime(Array(reads).fill(PACE_MIN));
+  assert(took < reads / 4, `${reads} small bulk reads took ${took.toFixed(0)} ms`);
+});
+
+Deno.test('a wait that lets most of a buffer arrive is made before every bulk read', async () => {
+  // A path where data piles up while a read waits: each wait pays.
+  const reads = 50;
+  const took = await readTime(Array(reads).fill((READ_BUFFER * 3) / 4));
+  assert(took >= reads - 1, `${reads} paced reads took ${took.toFixed(0)} ms`);
 });
 
 Deno.test('transportChunks reads a transport without read() through its stream', async () => {
