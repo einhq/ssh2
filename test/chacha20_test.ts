@@ -315,6 +315,24 @@ Deno.test('ChaChaPolyCipher sends a full batch and keeps filling the next', asyn
   assertEquals(toHex(concat(records)), toHex(expected));
 });
 
+Deno.test('ChaChaPolyCipher writes the records of batches sealed on several threads in order', async () => {
+  // Sixteen full batches in flight at once, more than the pool has threads.
+  const count = 128;
+  const expected = concat(
+    await Promise.all(Array.from({ length: count }, (_, i) => seal(1000 + i, 32781))),
+  );
+  const records: Uint8Array[] = [];
+  const c = cipher(1000, records);
+  const pending: Promise<void>[] = [];
+  for (let i = 0; i < count; i++) {
+    const sealed = c.encrypt(fill(c.allocPacket(32781), 32781));
+    if (sealed) pending.push(sealed);
+  }
+  assertEquals(pending.length >= 16, true);
+  await Promise.all(pending);
+  assertEquals(await sha256(concat(records)), await sha256(expected));
+});
+
 Deno.test('ChaChaPolyCipher writes nothing once freed', async () => {
   const records: Uint8Array[] = [];
   const c = cipher(0, records);

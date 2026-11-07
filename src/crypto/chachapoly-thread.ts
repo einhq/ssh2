@@ -1,17 +1,21 @@
 /**
- * chacha20-poly1305@openssh.com sealing and opening on a worker thread.
+ * chacha20-poly1305@openssh.com sealing and opening on worker threads.
  *
  * Sealing or opening a 32 KiB packet takes the thread that does it about 40 µs,
- * most of it Poly1305 and ChaCha20. A connection's large packets go to one
- * worker, shared by every connection in the process, in batches: a message
+ * most of it Poly1305 and ChaCha20. A connection's large packets go to a pool
+ * of workers, shared by every connection in the process, in batches: a message
  * costs the main thread about 23 µs there and back, whatever its size, so a
  * batch carries as many packets as are waiting. Opened payloads are written
  * to a buffer the worker allocates, so that its pages are faulted in there.
  *
- * The worker is started from a Blob URL holding the source of
+ * A batch goes to the ready worker with the fewest batches waiting; another
+ * is started while every ready one has some, up to MAX_THREADS. Any worker can
+ * take any batch: each carries the 64-byte SSH key and its first sequence
+ * number, and the cipher and decipher put the results back in order.
+ *
+ * A worker is started from a Blob URL holding the source of
  * `chachaPolyWorker`, so it needs no module of its own to be fetched or cached.
- * It keeps nothing between batches: each one carries the 64-byte SSH key. It
- * stops once it has been idle for IDLE_MS.
+ * They stop together once none has had a batch for IDLE_MS.
  */
 
 import { CHACHAPOLY_WASM } from './chachapoly-wasm.ts';
@@ -19,8 +23,18 @@ import { CHACHAPOLY_WASM } from './chachapoly-wasm.ts';
 /** Room for the packets of one batch, before their tags. */
 const BATCH = 256 * 1024;
 
-/** How long the worker outlives its last batch, so that a busy connection starts it once. */
-const IDLE_MS = 1000;
+/**
+ * How long the workers outlive the last batch. A worker started from a worker,
+ * as a server on a thread of its own starts them, takes about a second to
+ * answer, so requests some seconds apart should find them running.
+ */
+const IDLE_MS = 30_000;
+
+/** The `seq` of the reply that says a worker is ready; batches count from 1. */
+const READY = 0;
+
+/** The most workers at once: half the CPUs, which leaves the others to the threads that feed them. */
+const MAX_THREADS = Math.max(1, Math.min(4, Math.floor((navigator.hardwareConcurrency || 2) / 2)));
 
 /** Batch buffers the worker gave back; a fresh one faults in every page as it is filled. */
 const spare: ArrayBuffer[] = [];
@@ -47,7 +61,7 @@ interface BatchRequest {
 
 interface InitRequest {
   op: 'init';
-  wasm: Uint8Array;
+  wasm: WebAssembly.Module;
 }
 
 interface BatchReply {
@@ -181,9 +195,10 @@ function chachaPolyWorker(createCipheriv: typeof import('node:crypto').createCip
   const scope = self as unknown as Scope;
   scope.onmessage = ({ data }) => {
     if (data.op === 'init') {
-      wasm = new WebAssembly.Instance(new WebAssembly.Module(data.wasm as BufferSource))
-        .exports as unknown as Exports;
+      wasm = new WebAssembly.Instance(data.wasm).exports as unknown as Exports;
       mem = new Uint8Array(wasm.memory.buffer);
+      // READY: this source runs on its own, without the module around it.
+      scope.postMessage({ seq: 0, out: new ArrayBuffer(0) }, []);
       return;
     }
     mem.set(data.key.subarray(0, 64), KEY_MAIN);
@@ -207,72 +222,104 @@ function chachaPolyWorker(createCipheriv: typeof import('node:crypto').createCip
 
 type Thread = {
   worker: Worker;
+  /** Whether it has said it is ready: started from a worker, a worker takes about a second to. */
+  warm: boolean;
   replies: Map<number, { resolve: (reply: BatchReply) => void; reject: (error: Error) => void }>;
-  idleTimer?: ReturnType<typeof setTimeout>;
-  /** When the last reply came; the worker stops IDLE_MS after it. */
-  idleSince: number;
 };
 
-let thread: Thread | undefined;
+const threads: Thread[] = [];
 let workerUrl: string | undefined;
+/**
+ * The WebAssembly, compiled once for every worker: they share its code, and the
+ * optimized code V8 makes of it once it runs hot, which a worker compiling its
+ * own would wait for at every start.
+ */
+let compiled: WebAssembly.Module | undefined;
 let nextSeq = 1;
+/** When the last reply came, from any worker; the pool stops IDLE_MS after it. */
+let idleSince = 0;
+let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
 const stopThread = (stopping: Thread, error: Error) => {
-  if (thread === stopping) thread = undefined;
-  clearTimeout(stopping.idleTimer);
+  const at = threads.indexOf(stopping);
+  if (at >= 0) threads.splice(at, 1);
   stopping.worker.terminate();
   for (const reply of stopping.replies.values()) reply.reject(error);
   stopping.replies.clear();
 };
 
 /**
- * Stops the worker once nobody has waited on it for IDLE_MS. The timer is set
- * once and looks again when it fires, rather than being set again after every
- * batch. It does not keep the process alive, but the worker does until it fires.
+ * Stops every worker once none has had a batch for IDLE_MS. They stop
+ * together: a worker the others leave idle during a transfer is kept, since
+ * starting one again costs it its warm-up. The timer is set once and looks
+ * again when it fires, rather than being set again after every batch. It does
+ * not keep the process alive, but the workers do until it fires.
  */
-const releaseThread = (owner: Thread) => {
-  owner.idleSince = performance.now();
-  if (owner.idleTimer !== undefined) return;
+const releaseThreads = () => {
+  idleSince = performance.now();
+  if (idleTimer !== undefined) return;
   const check = (delay: number) => {
-    const timer = setTimeout(() => {
-      owner.idleTimer = undefined;
-      if (owner !== thread) return;
-      if (owner.replies.size > 0) return;
-      const idle = performance.now() - owner.idleSince;
-      if (idle >= IDLE_MS) stopThread(owner, new Error('the chacha20-poly1305 thread stopped'));
-      else check(IDLE_MS - idle);
+    idleTimer = setTimeout(() => {
+      idleTimer = undefined;
+      if (threads.some((t) => t.replies.size > 0)) return;
+      const idle = performance.now() - idleSince;
+      if (idle < IDLE_MS) return check(IDLE_MS - idle);
+      for (const t of [...threads]) {
+        stopThread(t, new Error('the chacha20-poly1305 thread stopped'));
+      }
     }, delay);
-    Deno.unrefTimer(timer);
-    owner.idleTimer = timer;
+    Deno.unrefTimer(idleTimer);
   };
   check(IDLE_MS);
 };
 
-/** The worker, started on first use. One that fails fails the batches it holds. */
-const startedThread = (): Thread => {
-  if (thread) return thread;
+/** Starts a worker; it takes batches once it says it is ready. One that fails fails the batches it holds. */
+const startThread = (): Thread => {
   workerUrl ??= URL.createObjectURL(
     new Blob([
       `import { createCipheriv } from 'node:crypto';\n(${chachaPolyWorker})(createCipheriv);\n`,
     ], { type: 'text/javascript' }),
   );
   const worker = new Worker(workerUrl, { type: 'module' });
-  const started: Thread = { worker, replies: new Map(), idleSince: performance.now() };
+  const started: Thread = { worker, warm: false, replies: new Map() };
   worker.onmessage = ({ data }: MessageEvent<BatchReply>) => {
+    if (data.seq === READY) {
+      started.warm = true;
+      return;
+    }
     if (data.buf && spare.length < MAX_SPARE) spare.push(data.buf);
     const reply = started.replies.get(data.seq);
     if (!reply) return;
     started.replies.delete(data.seq);
     reply.resolve(data);
-    releaseThread(started);
+    releaseThreads();
   };
   worker.onerror = (event) => {
     event.preventDefault();
     stopThread(started, new Error(`the chacha20-poly1305 thread failed: ${event.message}`));
   };
-  worker.postMessage({ op: 'init', wasm: CHACHAPOLY_WASM } satisfies InitRequest);
-  thread = started;
+  compiled ??= new WebAssembly.Module(CHACHAPOLY_WASM as BufferSource);
+  worker.postMessage({ op: 'init', wasm: compiled } satisfies InitRequest);
+  threads.push(started);
   return started;
+};
+
+/**
+ * The worker for the next batch: the least busy ready one. While every ready
+ * one is busy, another is started, one at a time, up to MAX_THREADS; the
+ * batch still goes to a ready one, since a connection's records are written in
+ * order and one batch waiting for a start holds back all that follow it. Only
+ * when none is ready does the batch wait for a start.
+ */
+const startedThread = (): Thread => {
+  let least: Thread | undefined;
+  for (const t of threads) if (t.warm && (!least || t.replies.size < least.replies.size)) least = t;
+  const starting = threads.find((t) => !t.warm);
+  if (!starting && threads.length < MAX_THREADS && (!least || least.replies.size > 0)) {
+    const fresh = startThread();
+    if (!least) return fresh;
+  }
+  return least ?? starting!;
 };
 
 const request = (
