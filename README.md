@@ -67,7 +67,8 @@ This fork is a complete rewrite of ssh2 for the Deno ecosystem. The major change
 - **TypeScript-first**: Written entirely in TypeScript with complete type definitions.
 - **Deno runtime**: Uses Deno's built-in APIs and test framework instead of Node.js.
 - **Web Standard APIs**: Uses Web Crypto API, Web Compression API
-  (CompressionStream/DecompressionStream), and other web standards instead of Node.js built-ins.
+  (CompressionStream/DecompressionStream), and other web standards instead of Node.js built-ins. The
+  one exception is ChaCha20, which comes from `node:crypto`; see [Cryptography](#cryptography).
 - **Promise/async-await only**: All client methods return Promises. No callback overloads.
 - **No DSA support**: DSA keys are deprecated and not supported by Web Crypto API. All DSA code and
   tests have been removed.
@@ -75,8 +76,8 @@ This fork is a complete rewrite of ssh2 for the Deno ecosystem. The major change
   supported.
 - **No HTTPAgent/HTTPSAgent**: These Node.js-specific http.Agent wrappers have been removed.
 - **No native bindings**: The `cpu-features` and C++ crypto bindings have been removed. All
-  cryptography uses Deno's built-in Web Crypto API plus vendored pure-TypeScript code; see
-  [Cryptography](#cryptography) for more information.
+  cryptography uses what Deno has built in (the Web Crypto API, and `node:crypto` for ChaCha20) plus
+  vendored TypeScript and WebAssembly; see [Cryptography](#cryptography) for more information.
 - **No encrypted old-style PEM keys**: Legacy PEM keys encrypted with `Proc-Type: 4,ENCRYPTED`
   (using MD5-based EVP_BytesToKey derivation) are not supported. Convert them to the modern OpenSSH
   format with: `ssh-keygen -p -o -f <keyfile>`. Encrypted new-format OpenSSH keys, PPK keys, and all
@@ -813,7 +814,9 @@ Almost all cryptography runs on Deno's built-in
 - RSA and ECDSA key generation, signing, and verification
 - Ed25519 key generation, signing, and verification
 - Key exchange: X25519 (`curve25519-sha256`) and ECDH over P-256/P-384/P-521
-- AES-CTR and AES-GCM (transport ciphers and private-key decryption)
+- AES-CTR and AES-GCM (transport ciphers and private-key decryption). Deno's `node:crypto` also has
+  AES-GCM, but at about a third of Web Crypto's speed (Deno 2.9.7: ~165 MB/s against ~600 MB/s for
+  32 KiB packets one at a time)
 - AES-CBC — Web Crypto only offers PKCS#7-padded CBC, so the raw (unpadded) CBC that SSH requires is
   implemented on top of it in `src/crypto/aes-cbc.ts`
 - Random number generation
@@ -824,14 +827,15 @@ The two features Web Crypto does not cover are provided without any third-party 
   (`src/crypto/chachapoly.wat`, assembled into `src/crypto/chachapoly-wasm.ts` by
   `deno task build:wasm`), with payloads of 2 KiB and more encrypted by the runtime's native
   `chacha20` cipher from `node:crypto` (available in Deno 2.9.4+). Outbound packets with a payload
-  of 2 KiB or more, and those sent while any wait, are sealed in batches on a web Worker shared by
-  every connection in the process (`src/crypto/chachapoly-thread.ts`), and inbound packets of 2 KiB
-  or more are opened there, as many as a socket read brings, so that a transfer's cipher work leaves
-  the main thread; the Worker stops after 1 s without work. A connection over a `DenoTransport`
-  reads its socket into one 256 KiB buffer. During a bulk transfer (reads of 32 KiB or more) the
-  next read waits 1 ms when the last one did not fill the buffer, so that it brings many packets at
-  once, and on the server what the connection writes between two such reads, such as the replies to
-  an upload's SFTP writes, goes out in one write before the next read starts.
+  of 2 KiB or more, and those sent while any wait, are sealed in batches on a pool of web Workers
+  shared by every connection in the process (`src/crypto/chachapoly-thread.ts`), and inbound packets
+  of 2 KiB or more are opened there, as many as a socket read brings, so that a transfer's cipher
+  work leaves the main thread. A batch goes to the least busy Worker; the pool grows to half the
+  CPUs (at most 4) and stops after 30 s without work. A connection over a `DenoTransport` reads its
+  socket into one 256 KiB buffer. During a bulk transfer (reads of 32 KiB or more) the next read
+  waits 1 ms when the last one did not fill the buffer, so that it brings many packets at once, and
+  on the server what the connection writes between two such reads, such as the replies to an
+  upload's SFTP writes, goes out in one write before the next read starts.
 - **`bcrypt` KDF** — used when reading or writing passphrase-protected OpenSSH private keys
   (`src/keygen.ts`, `src/protocol/keyParser.ts`); provided by a vendored `bcrypt_pbkdf`
   implementation (`src/crypto/bcrypt-pbkdf.ts`).

@@ -183,6 +183,7 @@ export class NullDecipher implements Decipher {
 
 /**
  * AES-GCM Cipher
+ * Seals with Web Crypto: Deno's node:crypto AES-GCM is about a third as fast.
  * Uses a write queue to ensure packets are sent in order, even when
  * multiple encrypt() calls happen concurrently.
  */
