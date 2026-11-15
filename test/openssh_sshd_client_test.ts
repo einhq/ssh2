@@ -99,8 +99,10 @@ async function startSshd(authorizedKeys: string[]): Promise<Sshd> {
       break;
     } catch {
       if (Date.now() > deadline) {
-        child.kill();
-        const err = new TextDecoder().decode((await child.output()).stderr);
+        try {
+          child.kill();
+        } catch { /* it exited by itself, and its stderr says why */ }
+        const err = await readAll(child.stderr);
         throw new Error(`sshd did not start: ${err}`);
       }
       await new Promise((r) => setTimeout(r, 50));

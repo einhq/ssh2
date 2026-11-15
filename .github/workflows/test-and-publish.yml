@@ -21,9 +21,11 @@ jobs:
 
       # Install sshpass so the OpenSSH interop tests (which drive the `ssh`
       # client with password auth) run instead of being skipped. The `ssh`
-      # client itself is already present on ubuntu-latest runners.
+      # client itself is already present on ubuntu-latest runners. A job that
+      # runs as root (Forgejo's runner) starts a privileged sshd, which needs
+      # its privilege separation directory.
       - name: Install sshpass for OpenSSH interop tests
-        run: sudo apt-get update && sudo apt-get install -y sshpass
+        run: sudo apt-get update && sudo apt-get install -y sshpass && sudo mkdir -p /run/sshd
 
       # Check if the code is formatted according to Deno's default
       # formatting conventions.
