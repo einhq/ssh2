@@ -122,8 +122,17 @@ const VALID_SIGNALS = new Set([
  * Provides Node.js-style write() method
  */
 export interface StderrWritable {
-  write(data: Uint8Array | string): void;
+  /** Queue data for the remote; settles once it is sent, or dropped because the channel closed first. */
+  write(data: Uint8Array | string): Promise<void>;
 }
+
+/**
+ * What waits to go out on a channel, in the order it was asked for: data for
+ * stdout or stderr, or a message that must follow the data before it (EOF, exit).
+ */
+type Outgoing =
+  | { data: Uint8Array; isStderr: boolean; done: () => void }
+  | { send: () => void };
 
 /**
  * Encode string to Uint8Array
@@ -178,19 +187,14 @@ export class Channel extends EventEmitter<ChannelEvents> {
   /** Has X11 forwarding */
   private _hasX11 = false;
 
-  /** Waiting for window space */
+  /** Data and messages the remote's window has not let out yet, oldest first */
+  private _queue: Outgoing[] = [];
+
+  /** The queue stopped for want of window, so emptying it emits 'drain' */
   private _waitWindow = false;
 
   /** Waiting for channel drain */
   private _waitChanDrain = false;
-
-  /** Pending data chunk */
-  private _chunk?: Uint8Array;
-  private _chunkcb?: () => void;
-
-  /** Pending stderr chunk */
-  private _chunkErr?: Uint8Array;
-  private _chunkcbErr?: () => void;
 
   /** ReadableStream for incoming data (stdout) */
   private _readable: ReadableStream<Uint8Array>;
@@ -247,9 +251,10 @@ export class Channel extends EventEmitter<ChannelEvents> {
       },
       close: () => {
         this._writableClosed = true;
-        this.eof();
         if (this.server || !this.allowHalfOpen) {
-          this.close();
+          this.end();
+        } else {
+          this.eof();
         }
       },
       abort: () => {
@@ -268,9 +273,7 @@ export class Channel extends EventEmitter<ChannelEvents> {
       });
       // Create Node.js-style stderr wrapper for server-side
       this._stderrWritable = {
-        write: (data: Uint8Array | string) => {
-          this._writeDataSync(encodeData(data), true);
-        },
+        write: (data: Uint8Array | string) => this._writeData(encodeData(data), true),
       };
     } else {
       // Client: readable stderr (receive from server)
@@ -320,112 +323,70 @@ export class Channel extends EventEmitter<ChannelEvents> {
   }
 
   /**
-   * Write data to the channel
+   * Queue data for the remote. It goes out in packets as the remote's window
+   * allows, after everything queued before it; the promise settles once it
+   * is sent, or dropped because the channel stopped sending first.
    */
-  private async _writeData(data: Uint8Array, isStderr: boolean): Promise<void> {
-    const protocol = this._client._protocol;
-    const outgoing = this.outgoing;
-    const packetSize = outgoing.packetSize;
-    const id = outgoing.id;
-
-    if (id === undefined || outgoing.state !== 'open') {
-      return;
+  private _writeData(data: Uint8Array, isStderr: boolean): Promise<void> {
+    if (this.outgoing.id === undefined || this.outgoing.state !== 'open') {
+      return Promise.resolve();
     }
-
-    let window = outgoing.window;
-    const len = data.length;
-    let p = 0;
-
-    while (len - p > 0 && window > 0) {
-      let sliceLen = len - p;
-      if (sliceLen > window) sliceLen = window;
-      if (sliceLen > packetSize) sliceLen = packetSize;
-
-      const chunk = p === 0 && sliceLen === len ? data : data.subarray(p, p + sliceLen);
-
-      if (isStderr) {
-        protocol.channelExtData(id, chunk, STDERR);
-      } else {
-        protocol.channelData(id, chunk);
-      }
-
-      p += sliceLen;
-      window -= sliceLen;
-    }
-
-    outgoing.window = window;
-
-    // If we still have data to send, wait for window space
-    if (len - p > 0) {
-      if (window === 0) {
-        this._waitWindow = true;
-      }
-
-      // Store pending data
-      const remaining = p > 0 ? data.subarray(p, len) : data;
-
-      return new Promise<void>((resolve) => {
-        if (isStderr) {
-          this._chunkErr = remaining;
-          this._chunkcbErr = resolve;
-        } else {
-          this._chunk = remaining;
-          this._chunkcb = resolve;
-        }
-      });
-    }
+    return new Promise<void>((done) => {
+      this._queue.push({ data, isStderr, done });
+      this._flush();
+    });
   }
 
-  /**
-   * Write data synchronously (non-blocking, fire-and-forget)
-   * Used for Node.js-style write() compatibility
-   */
-  private _writeDataSync(data: Uint8Array, isStderr: boolean): void {
+  /** Send `send` once the data queued before it is out. */
+  private _afterQueued(send: () => void): void {
+    this._queue.push({ send });
+    this._flush();
+  }
+
+  /** Send from the head of the queue for as long as the remote's window allows. */
+  private _flush(): void {
     const protocol = this._client._protocol;
     const outgoing = this.outgoing;
-    const packetSize = outgoing.packetSize;
-    const id = outgoing.id;
 
-    if (id === undefined || outgoing.state !== 'open') {
-      return;
-    }
+    while (this._queue.length > 0) {
+      const head = this._queue[0];
+      if ('send' in head) {
+        this._queue.shift();
+        head.send();
+        continue;
+      }
 
-    let window = outgoing.window;
-    const len = data.length;
-    let p = 0;
+      const id = outgoing.id;
+      if (id === undefined || outgoing.state !== 'open') {
+        this._queue.shift();
+        head.done();
+        continue;
+      }
+      if (outgoing.window === 0 && head.data.length > 0) {
+        this._waitWindow = true;
+        return;
+      }
 
-    while (len - p > 0 && window > 0) {
-      let sliceLen = len - p;
-      if (sliceLen > window) sliceLen = window;
-      if (sliceLen > packetSize) sliceLen = packetSize;
-
-      const chunk = p === 0 && sliceLen === len ? data : data.subarray(p, p + sliceLen);
-
-      if (isStderr) {
+      const len = Math.min(head.data.length, outgoing.window, outgoing.packetSize);
+      const chunk = len === head.data.length ? head.data : head.data.subarray(0, len);
+      if (head.isStderr) {
         protocol.channelExtData(id, chunk, STDERR);
       } else {
         protocol.channelData(id, chunk);
       }
+      outgoing.window -= len;
 
-      p += sliceLen;
-      window -= sliceLen;
+      if (len === head.data.length) {
+        this._queue.shift();
+        head.done();
+      } else {
+        head.data = head.data.subarray(len);
+      }
     }
 
-    outgoing.window = window;
-
-    // Queue remaining data for later (when window opens)
-    if (len - p > 0) {
-      if (window === 0) {
-        this._waitWindow = true;
-      }
-      const remaining = p > 0 ? data.subarray(p, len) : data;
-      if (isStderr) {
-        this._chunkErr = remaining;
-        this._chunkcbErr = () => {};
-      } else {
-        this._chunk = remaining;
-        this._chunkcb = () => {};
-      }
+    if (this._waitWindow) {
+      this._waitWindow = false;
+      this.emit('drain');
     }
   }
 
@@ -485,43 +446,21 @@ export class Channel extends EventEmitter<ChannelEvents> {
    */
   adjustWindow(amount: number): void {
     this.outgoing.window += amount;
-
-    // Resume pending writes if we have data waiting
-    if (this._waitWindow && this.outgoing.window > 0) {
-      this._waitWindow = false;
-
-      // Flush pending data
-      if (this._chunk && this._chunkcb) {
-        const chunk = this._chunk;
-        const cb = this._chunkcb;
-        this._chunk = undefined;
-        this._chunkcb = undefined;
-        this._writeData(chunk, false).then(cb);
-      }
-
-      if (this._chunkErr && this._chunkcbErr) {
-        const chunk = this._chunkErr;
-        const cb = this._chunkcbErr;
-        this._chunkErr = undefined;
-        this._chunkcbErr = undefined;
-        this._writeData(chunk, true).then(cb);
-      }
-
-      this.emit('drain');
-    }
-
+    this._flush();
     notifyWindowAdjust(this.outgoing);
   }
 
   /**
-   * Signal end of file (no more data to send)
+   * Signal end of file (no more data to send), once the data written before it is sent
    */
   eof(): void {
-    if (this.outgoing.state === 'open' && this.outgoing.id !== undefined) {
-      this.outgoing.state = 'eof';
-      this._client._protocol.channelEOF(this.outgoing.id);
-      this.emit('eof');
-    }
+    this._afterQueued(() => {
+      if (this.outgoing.state === 'open' && this.outgoing.id !== undefined) {
+        this.outgoing.state = 'eof';
+        this._client._protocol.channelEOF(this.outgoing.id);
+        this.emit('eof');
+      }
+    });
   }
 
   /**
@@ -539,9 +478,12 @@ export class Channel extends EventEmitter<ChannelEvents> {
   }
 
   /**
-   * Close the channel
+   * Close the channel now. Data the remote's window has not let out yet is
+   * dropped; EOF and exit asked for before are sent first. end() closes once
+   * everything is sent.
    */
   close(): void {
+    this._dropQueued();
     if (
       (this.outgoing.state === 'open' || this.outgoing.state === 'eof') &&
       this.outgoing.id !== undefined
@@ -551,12 +493,24 @@ export class Channel extends EventEmitter<ChannelEvents> {
     }
   }
 
+  /** Settle every queued write unsent, and send the messages queued among them. */
+  private _dropQueued(): void {
+    const queue = this._queue;
+    this._queue = [];
+    this._waitWindow = false;
+    for (const entry of queue) {
+      if ('send' in entry) entry.send();
+      else entry.done();
+    }
+  }
+
   /**
    * Handle incoming close
    */
   handleClose(): void {
     this.incoming.state = 'closed';
     this.outgoing.state = 'closed';
+    this._dropQueued();
 
     if (this._readableController && !this._readableClosed) {
       try {
@@ -589,20 +543,22 @@ export class Channel extends EventEmitter<ChannelEvents> {
   // Node.js-style compatibility methods =======================================
 
   /**
-   * Write data to the channel (Node.js-style synchronous write)
-   * For server-side use with exec/shell sessions
+   * Write data to the channel (Node.js-style). Nothing is lost while the remote's
+   * window is full: the data waits its turn, and the promise settles once it is
+   * sent (or dropped by a close). Awaiting it keeps a fast writer from piling up
+   * what a slow reader has not taken.
    */
-  write(data: Uint8Array | string): void {
-    this._writeDataSync(encodeData(data), false);
+  write(data: Uint8Array | string): Promise<void> {
+    return this._writeData(encodeData(data), false);
   }
 
   /**
-   * End the channel (close write side and send EOF)
+   * End the channel: EOF and close, once everything written before is sent
    * For server-side use with exec/shell sessions
    */
   end(): void {
     this.eof();
-    this.close();
+    this._afterQueued(() => this.close());
   }
 
   /**
@@ -667,29 +623,31 @@ export class Channel extends EventEmitter<ChannelEvents> {
   }
 
   /**
-   * Send exit status or signal (server only)
+   * Send exit status or signal (server only), once the data written before it is sent
    */
   sendExit(statusOrSignal: number | string, coreDumped?: boolean, msg?: string): void {
     if (!this.server) {
       throw new Error('Server-only method called in client mode');
     }
 
-    if (
-      this.type === 'session' &&
-      this.outgoing.state === 'open' &&
-      this.outgoing.id !== undefined
-    ) {
-      if (typeof statusOrSignal === 'number') {
-        this._client._protocol.exitStatus?.(this.outgoing.id, statusOrSignal);
-      } else {
-        this._client._protocol.exitSignal?.(
-          this.outgoing.id,
-          statusOrSignal,
-          coreDumped ?? false,
-          msg ?? '',
-        );
+    this._afterQueued(() => {
+      if (
+        this.type === 'session' &&
+        this.outgoing.state === 'open' &&
+        this.outgoing.id !== undefined
+      ) {
+        if (typeof statusOrSignal === 'number') {
+          this._client._protocol.exitStatus?.(this.outgoing.id, statusOrSignal);
+        } else {
+          this._client._protocol.exitSignal?.(
+            this.outgoing.id,
+            statusOrSignal,
+            coreDumped ?? false,
+            msg ?? '',
+          );
+        }
       }
-    }
+    });
   }
 
   /**

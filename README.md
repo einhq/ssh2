@@ -691,6 +691,13 @@ Channel is a duplex stream used by both clients and servers.
   side can still send data.
 
 - **close** event - Emitted when the channel is fully closed on both sides.
+- **write**(data: Uint8Array | string): Promise\<void\> - Queue data for the remote. It goes out as
+  the remote's window allows, after everything queued before it, and nothing is dropped while the
+  window is full; the promise settles once the data is sent. Await it to keep a fast writer from
+  holding more than the reader has taken.
+- **end**() - Send EOF and close once everything written before is sent. **eof**() and **exit**()
+  likewise wait for the data before them; **close**() closes at once and drops what the window has
+  not let out yet.
 
 Client-specific (for exec/shell):
 
@@ -708,7 +715,7 @@ Server-specific (for exec/shell):
 
 - **exit**(exitCode: number) or **exit**(signalName, coreDumped?, errorMsg?) - Send exit status to
   the client.
-- **stderr** property is a writable stream.
+- **stderr** property has a `write(data): Promise<void>` that queues like the channel's own.
 
 ### Pseudo-TTY settings
 

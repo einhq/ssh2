@@ -10,6 +10,7 @@
 
 import { assertEquals, assertGreater, assertStringIncludes } from '@std/assert';
 import { OpenSSHAgent } from '../src/agent.ts';
+import type { StderrWritable } from '../src/Channel.ts';
 import { Client } from '../src/client.ts';
 import {
   type Connection,
@@ -108,6 +109,15 @@ async function runSsh(
   };
 }
 
+/** `n` bytes of letters in 64 KiB chunks, each chunk a letter of its own. */
+function largeOutput(n: number): Uint8Array[] {
+  const chunks: Uint8Array[] = [];
+  for (let at = 0; at < n; at += 65536) {
+    chunks.push(new Uint8Array(Math.min(65536, n - at)).fill(65 + chunks.length % 26));
+  }
+  return chunks;
+}
+
 /**
  * Create a test server with specific options
  */
@@ -149,6 +159,15 @@ async function createTestServer(options: {
         session.on('exec', (accept, _reject, info) => {
           const stream = accept();
           if (!stream) return;
+          // `bytes <n>`: n bytes in 64 KiB writes, none awaited, then a line on stderr and exit 3
+          const bytes = /^bytes (\d+)$/.exec(info.command);
+          if (bytes) {
+            for (const chunk of largeOutput(Number(bytes[1]))) stream.write(chunk);
+            (stream.stderr as StderrWritable).write('done\n');
+            stream.exit(3);
+            stream.end();
+            return;
+          }
           // Echo the command back
           const response = `Command received: ${info.command}\n`;
           stream.write(new TextEncoder().encode(response));
@@ -232,6 +251,33 @@ Deno.test({
 
       assertEquals(result.code, 0, `SSH failed with stderr: ${result.stderr}`);
       assertStringIncludes(result.stdout, 'Command received: echo hello');
+    } finally {
+      await testServer.close();
+    }
+  },
+  sanitizeResources: false,
+  sanitizeOps: false,
+});
+
+Deno.test({
+  name:
+    'integration-openssh: exec output past the client window arrives whole, before exit and EOF',
+  ignore: !(await checkSshpass()),
+  async fn() {
+    const hostKey = await generateTestHostKeyEd25519();
+    const testServer = await createTestServer({ hostKey });
+    const size = 7 * 1024 * 1024 + 123;
+
+    try {
+      const result = await runSsh(testServer.port, `bytes ${size}`, { password: 'testpass' });
+
+      assertEquals(result.code, 3, `SSH failed with stderr: ${result.stderr}`);
+      assertEquals(result.stdout.length, size);
+      assertEquals(
+        result.stdout,
+        largeOutput(size).map((chunk) => new TextDecoder().decode(chunk)).join(''),
+      );
+      assertEquals(result.stderr, 'done\n');
     } finally {
       await testServer.close();
     }

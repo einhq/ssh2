@@ -209,6 +209,106 @@ Deno.test('Channel: write does nothing when outgoing state is not open', () => {
   assertEquals(client.calls.length, 0);
 });
 
+Deno.test('Channel: writes past the window wait their turn and none is lost', async () => {
+  const client = createMockClient();
+  const info = makeInfo();
+  info.outgoing.window = 5;
+  const chan = new Channel(client, info, { server: true });
+  const settled: string[] = [];
+
+  const first = chan.write('abcdefgh').then(() => settled.push('first'));
+  const second = chan.write('ijkl').then(() => settled.push('second'));
+  const third = (chan.stderr as { write: (d: string) => Promise<void> }).write('ERR');
+  chan.write('mn');
+
+  const sent = () =>
+    client.calls.filter((c) => c.method === 'channelData' || c.method === 'channelExtData').map((
+      c,
+    ) => new TextDecoder().decode(c.args[1] as Uint8Array)).join('|');
+  assertEquals(sent(), 'abcde');
+  await Promise.resolve();
+  assertEquals(settled, []);
+
+  chan.adjustWindow(4);
+  assertEquals(sent(), 'abcde|fgh|i');
+  chan.adjustWindow(100);
+  assertEquals(sent(), 'abcde|fgh|i|jkl|ERR|mn');
+  await Promise.all([first, second, third]);
+  assertEquals(settled, ['first', 'second']);
+});
+
+Deno.test('Channel: write sends in packets of the remote packet size', () => {
+  const client = createMockClient();
+  const chan = new Channel(client, makeInfo());
+
+  chan.write(new Uint8Array(PACKET_SIZE * 2 + 1));
+
+  assertEquals(client.calls.map((c) => (c.args[1] as Uint8Array).length), [
+    PACKET_SIZE,
+    PACKET_SIZE,
+    1,
+  ]);
+});
+
+Deno.test('Channel: exit, EOF and close from end() follow the data still waiting for window', () => {
+  const client = createMockClient();
+  const info = makeInfo();
+  info.outgoing.window = 2;
+  const chan = new Channel(client, info, { server: true });
+
+  chan.write('abcd');
+  chan.exit(0);
+  chan.end();
+  assertEquals(client.calls.map((c) => c.method), ['channelData']);
+
+  chan.adjustWindow(2);
+  assertEquals(client.calls.map((c) => c.method), [
+    'channelData',
+    'channelData',
+    'exitStatus',
+    'channelEOF',
+    'channelClose',
+  ]);
+  assertEquals(chan.outgoing.state, 'closing');
+});
+
+Deno.test('Channel: a write after EOF is dropped', async () => {
+  const client = createMockClient();
+  const chan = new Channel(client, makeInfo());
+
+  chan.eof();
+  await chan.write('late');
+
+  assertEquals(client.calls.map((c) => c.method), ['channelEOF']);
+});
+
+Deno.test('Channel: close drops the data waiting for window but sends the exit asked for before', async () => {
+  const client = createMockClient();
+  const info = makeInfo();
+  info.outgoing.window = 0;
+  const chan = new Channel(client, info, { server: true });
+
+  const waiting = chan.write('abcd');
+  chan.exit(1);
+  chan.close();
+  await waiting;
+
+  assertEquals(client.calls.map((c) => c.method), ['exitStatus', 'channelClose']);
+});
+
+Deno.test('Channel: the remote closing settles writes waiting for window', async () => {
+  const client = createMockClient();
+  const info = makeInfo();
+  info.outgoing.window = 0;
+  const chan = new Channel(client, info);
+
+  const waiting = chan.write('abcd');
+  chan.handleClose();
+  await waiting;
+
+  assertEquals(client.calls.length, 0);
+});
+
 // =============================================================================
 // eof and handleEOF
 // =============================================================================
