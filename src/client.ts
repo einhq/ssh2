@@ -846,10 +846,11 @@ export class Client extends EventEmitter<ClientEvents> {
    * Start reading from transport
    */
   private async _startReading() {
-    if (!this._transport) return;
+    const transport = this._transport;
+    if (!transport) return;
 
     try {
-      for await (const chunk of transportChunks(this._transport)) {
+      for await (const chunk of transportChunks(transport)) {
         try {
           await this._protocol?.parse(chunk, 0, chunk.length);
         } catch (err) {
@@ -863,6 +864,8 @@ export class Client extends EventEmitter<ClientEvents> {
         this.emit('error', err as Error);
       }
     } finally {
+      // Nothing more can be read, so the socket is closed whichever side ended it
+      transport.close();
       this._cleanup(new Error('Connection lost'));
       this.emit('end');
       this.emit('close');

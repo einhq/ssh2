@@ -1409,6 +1409,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
         this.emit('error', error);
       }
     } finally {
+      // Nothing more can be read, so the socket is closed whichever side ended it
+      this._transport.close();
       this._protocol.cleanup();
       this.emit('close');
       this._chanMgr.cleanup(new Error('Connection closed'));
@@ -1621,6 +1623,9 @@ export class Server extends EventEmitter<ServerEvents> {
   private _config: ServerConfig;
   private _hostKeysInitialized = false;
   private _connections = 0;
+  private _closed = false;
+  /** Ends the pause before the next accept, while there is one. */
+  private _wakeAccept?: () => void;
 
   maxConnections = Infinity;
 
@@ -1775,44 +1780,77 @@ export class Server extends EventEmitter<ServerEvents> {
   }
 
   /**
-   * Accept incoming connections
+   * Accept incoming connections until the server is closed. A failed accept
+   * (out of file descriptors or memory, a connection aborted while queued) is
+   * emitted as 'error', and the listener is asked again after a pause that
+   * doubles up to a second, as it is when its iteration ends by itself (an
+   * interrupted accept), so one bad moment does not leave the port open with
+   * nobody answering it.
    */
   private async _acceptConnections(): Promise<void> {
-    if (!this._listener) return;
-
-    try {
-      for await (const transport of this._listener) {
-        if (this._connections >= this.maxConnections) {
-          transport.close();
-          continue;
+    let pause = 0;
+    while (this._listener && !this._closed) {
+      try {
+        for await (const transport of this._listener) {
+          pause = 0;
+          this._serve(transport);
         }
-
-        this._connections++;
-
-        let debug = this._config.debug;
-        if (debug) {
-          const debugPrefix = `[${Date.now()}] `;
-          const origDebug = debug;
-          debug = (msg: string) => origDebug(`${debugPrefix}${msg}`);
-        }
-
-        const connection = new Connection(
-          transport,
-          this._hostKeys,
-          this._config.ident,
-          this._algorithms,
-          debug,
-          this,
-          this._config,
-        );
-
-        connection.on('close', () => {
-          this._connections--;
-        });
+      } catch (err) {
+        if (!this._closed) this.emit('error', err as Error);
       }
-    } catch (err) {
-      this.emit('error', err as Error);
+      if (this._closed) return;
+      pause = Math.min(pause ? pause * 2 : 5, 1000);
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          this._wakeAccept = undefined;
+          resolve();
+        }, pause);
+        this._wakeAccept = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
     }
+  }
+
+  /**
+   * Serves one transport, or closes it when the server is full. A connection
+   * that cannot be set up is closed and emitted as 'error'.
+   */
+  private _serve(transport: Transport): void {
+    if (this._connections >= this.maxConnections) {
+      transport.close();
+      return;
+    }
+
+    let debug = this._config.debug;
+    if (debug) {
+      const debugPrefix = `[${Date.now()}] `;
+      const origDebug = debug;
+      debug = (msg: string) => origDebug(`${debugPrefix}${msg}`);
+    }
+
+    let connection: Connection;
+    try {
+      connection = new Connection(
+        transport,
+        this._hostKeys,
+        this._config.ident,
+        this._algorithms,
+        debug,
+        this,
+        this._config,
+      );
+    } catch (err) {
+      transport.close();
+      this.emit('error', err as Error);
+      return;
+    }
+
+    this._connections++;
+    connection.on('close', () => {
+      this._connections--;
+    });
   }
 
   /**
@@ -1826,7 +1864,9 @@ export class Server extends EventEmitter<ServerEvents> {
    * Close the server
    */
   close(): this {
+    this._closed = true;
     this._listener?.close();
+    this._wakeAccept?.();
     this.emit('close');
     return this;
   }
@@ -1837,32 +1877,6 @@ export class Server extends EventEmitter<ServerEvents> {
    */
   async injectTransport(transport: Transport): Promise<void> {
     await this._initHostKeys();
-    if (this._connections >= this.maxConnections) {
-      transport.close();
-      return;
-    }
-
-    this._connections++;
-
-    let debug = this._config.debug;
-    if (debug) {
-      const debugPrefix = `[${Date.now()}] `;
-      const origDebug = debug;
-      debug = (msg: string) => origDebug(`${debugPrefix}${msg}`);
-    }
-
-    const connection = new Connection(
-      transport,
-      this._hostKeys,
-      this._config.ident,
-      this._algorithms,
-      debug,
-      this,
-      this._config,
-    );
-
-    connection.on('close', () => {
-      this._connections--;
-    });
+    this._serve(transport);
   }
 }
