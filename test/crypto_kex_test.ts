@@ -326,6 +326,21 @@ Deno.test('DHExchange modp14: computeSecret between two valid keys produces shar
   assertEquals(s1, s2);
 });
 
+Deno.test('DHExchange modp18: two sides agree, with an exponent short enough not to stall the event loop', async () => {
+  const kex = new DHExchange('diffie-hellman-group18-sha512', 'modp18', 'sha512');
+  const started = performance.now();
+  const r1 = await kex.generateKeyPair();
+  const r2 = await kex.generateKeyPair();
+  const s1 = await r1.computeSecret(r2.publicKey);
+  const s2 = await r2.computeSecret(r1.publicKey);
+  const took = performance.now() - started;
+
+  assertEquals(s1.length, 1024);
+  assertEquals(s1, s2);
+  // Both sides with a full 8192-bit exponent took about 1.4 s; with 1024 bits, about 0.16 s
+  assertEquals(took < 700, true, `took ${took.toFixed(0)} ms`);
+});
+
 // =============================================================================
 // createKeyExchange factory
 // =============================================================================

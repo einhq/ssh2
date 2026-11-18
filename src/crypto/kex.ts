@@ -335,6 +335,9 @@ function modPow(base: bigint, exp: bigint, mod: bigint): bigint {
   return result;
 }
 
+/** Digest length in bytes of each hash a MODP exchange uses. */
+const HASH_BYTES: Record<string, number> = { sha1: 20, sha256: 32, sha512: 64 };
+
 /**
  * Traditional Diffie-Hellman key exchange using MODP groups
  */
@@ -355,10 +358,13 @@ export class DHExchange implements KeyExchange {
   }
 
   async generateKeyPair(): Promise<KeyExchangeResult> {
-    // Generate random private key (should be < prime - 1)
-    // Use prime byte length for safety
-    const privateKeyBytes = randomBytes(this.group.primeByteLength);
-    const privateKey = bytesToBigint(privateKeyBytes) % (this.group.prime - BigInt(2)) + BigInt(1);
+    // The private exponent has twice the bits of the hash (512 at least), as
+    // OpenSSH's has, not the prime's: that is the strength the exchange needs,
+    // and a full-length exponent makes group18 about ten times as slow, all of
+    // it on the event loop and at a client's choosing
+    const exponentBytes = 2 * Math.max(32, HASH_BYTES[this.hashName] ?? 64);
+    const privateKey = bytesToBigint(randomBytes(exponentBytes)) |
+      BigInt(1) << BigInt(exponentBytes * 8 - 1);
 
     // Compute public key: g^x mod p
     const publicKeyBigint = modPow(this.group.generator, privateKey, this.group.prime);

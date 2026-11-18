@@ -82,6 +82,13 @@ const VALID_DISCONNECT_REASONS = new Set<number>(
   Object.values(DISCONNECT_REASON).filter((v) => typeof v === 'number') as number[],
 );
 
+/** The longest identification line, CR and LF included (RFC 4253 4.2). */
+const MAX_IDENT_LENGTH = 255;
+/** The longest line a server may send before its identification, as OpenSSH allows. */
+const MAX_PRE_IDENT_LINE_LENGTH = 8192;
+/** How many lines a server may send before its identification, as OpenSSH allows. */
+const MAX_PRE_IDENT_LINES = 1024;
+
 /**
  * Protocol configuration
  */
@@ -380,6 +387,11 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
       }
     }
 
+    const limit = this._server ? MAX_IDENT_LENGTH : MAX_PRE_IDENT_LINE_LENGTH;
+    if ((this._buffer?.length ?? 0) + (lineEnd === -1 ? len : lineEnd + 1) - i > limit) {
+      throw new Error(`a header line longer than ${limit} bytes`);
+    }
+
     if (lineEnd === -1) {
       // Incomplete line, buffer it
       if (this._buffer) {
@@ -447,6 +459,12 @@ export class Protocol extends EventEmitter implements FatalErrorProtocol, Handle
       this._sendKexInit();
 
       return lineEnd + 1;
+    }
+
+    // Only a server may send lines before its identification (RFC 4253 4.2)
+    if (this._server) throw new Error('the client sent a line that is not an SSH identification');
+    if (this._receivedGreeting.length >= MAX_PRE_IDENT_LINES) {
+      throw new Error(`more than ${MAX_PRE_IDENT_LINES} lines before the server's identification`);
     }
 
     // Not the SSH header line - this is a greeting line, collect it

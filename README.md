@@ -595,14 +595,21 @@ import { Client, generateKeyPair, parseKey, Server } from 'jsr:@ein/ssh2-ts';
 - **constructor**(config: ServerConfig, connectionListener?: function) - Creates a new Server
   instance. Config properties:
 
-  | Property     | Type                                           | Required | Description                        |
-  | ------------ | ---------------------------------------------- | -------- | ---------------------------------- |
-  | `hostKeys`   | Array\<string \| Uint8Array \| HostKeyConfig\> | Yes      | Host private keys                  |
-  | `algorithms` | AlgorithmConfig                                |          | Override default algorithms        |
-  | `banner`     | string                                         |          | Message sent before authentication |
-  | `greeting`   | string                                         |          | Message sent on connection         |
-  | `ident`      | string                                         |          | Custom server software identifier  |
-  | `debug`      | function                                       |          | Debug logging function             |
+  | Property               | Type                                           | Required | Description                                                                                     |
+  | ---------------------- | ---------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------- |
+  | `hostKeys`             | Array\<string \| Uint8Array \| HostKeyConfig\> | Yes      | Host private keys                                                                               |
+  | `algorithms`           | AlgorithmConfig                                |          | Override default algorithms                                                                     |
+  | `banner`               | string                                         |          | Message sent before authentication                                                              |
+  | `greeting`             | string                                         |          | Message sent on connection                                                                      |
+  | `ident`                | string                                         |          | Custom server software identifier                                                               |
+  | `debug`                | function                                       |          | Debug logging function                                                                          |
+  | `loginGraceTime`       | number                                         |          | Milliseconds a connection has to authenticate before it is closed; `0` never (default `120000`) |
+  | `maxStartups`          | number                                         |          | Connections not yet authenticated kept at once; one more is closed on accept (default `100`)    |
+  | `perSourceMaxStartups` | number                                         |          | The same, from one address (default `10`)                                                       |
+
+  A client's identification line may be 255 bytes at most, and a client may send nothing before it;
+  a `Client` accepts up to 1024 lines of 8192 bytes before the server's identification. A failed
+  accept is emitted as `error` and the server goes on accepting.
 
 - **listen**(port: number, host?: string, callback?: function): void - Start listening for
   connections.
@@ -783,6 +790,10 @@ Server-specific (for exec/shell):
 - `diffie-hellman-group18-sha512`
 
 **Also supported:** `diffie-hellman-group14-sha1`
+
+The MODP groups run in JavaScript on the event loop, with a private exponent of twice the hash's
+bits as OpenSSH's: a group18 exchange costs about 80 ms there. A server that anyone can reach may
+leave them out of `algorithms.kex`.
 
 ### Server Host Key
 

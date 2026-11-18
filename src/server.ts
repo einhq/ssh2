@@ -462,6 +462,8 @@ export interface ConnectionEvents {
  */
 export class Connection extends EventEmitter<ConnectionEvents> {
   private _transport: Transport;
+  /** Closes the connection if it has not authenticated in time. */
+  private _graceTimer?: ReturnType<typeof setTimeout>;
   private _protocol: Protocol;
   private _chanMgr: ChannelManager;
   private _debug?: (msg: string) => void;
@@ -515,6 +517,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
         if (allowed) {
           authCtx = undefined;
           this.authenticated = true;
+          clearTimeout(this._graceTimer);
+          this._graceTimer = undefined;
           this._protocol.authSuccess();
           pendingAuths.length = 0;
           this.emit('ready');
@@ -1301,6 +1305,17 @@ export class Connection extends EventEmitter<ConnectionEvents> {
 
     this._protocol = new Protocol(protocolConfig);
 
+    const grace = config.loginGraceTime ?? DEFAULT_LOGIN_GRACE_TIME;
+    if (grace > 0) {
+      this._graceTimer = setTimeout(() => {
+        this._graceTimer = undefined;
+        const err = new Error(`no authentication within ${grace} ms`) as Error & { level?: string };
+        err.level = 'client-timeout';
+        this.emit('error', err);
+        this._transport.close();
+      }, grace);
+    }
+
     // Start reading from transport
     this._startReading();
 
@@ -1409,6 +1424,8 @@ export class Connection extends EventEmitter<ConnectionEvents> {
         this.emit('error', error);
       }
     } finally {
+      clearTimeout(this._graceTimer);
+      this._graceTimer = undefined;
       // Nothing more can be read, so the socket is closed whichever side ended it
       this._transport.close();
       this._protocol.cleanup();
@@ -1583,6 +1600,21 @@ export interface ServerConfig {
   keepaliveInterval?: number;
   /** Max keepalive failures */
   keepaliveCountMax?: number;
+  /**
+   * Milliseconds a connection has to authenticate before it is closed, as
+   * OpenSSH's LoginGraceTime; 0 never closes it. Default 120000.
+   */
+  loginGraceTime?: number;
+  /**
+   * Connections not yet authenticated the server keeps at once; one more is
+   * closed as soon as it is accepted, as OpenSSH's MaxStartups. Default 100.
+   */
+  maxStartups?: number;
+  /**
+   * Connections not yet authenticated the server keeps at once from one
+   * address, as OpenSSH's PerSourceMaxStartups. Default 10.
+   */
+  perSourceMaxStartups?: number;
 }
 
 /**
@@ -1607,6 +1639,10 @@ export interface ServerEvents {
   close: [];
 }
 
+const DEFAULT_LOGIN_GRACE_TIME = 120_000;
+const DEFAULT_MAX_STARTUPS = 100;
+const DEFAULT_PER_SOURCE_MAX_STARTUPS = 10;
+
 /**
  * SSH Server
  */
@@ -1623,6 +1659,9 @@ export class Server extends EventEmitter<ServerEvents> {
   private _config: ServerConfig;
   private _hostKeysInitialized = false;
   private _connections = 0;
+  /** Connections not yet authenticated, by remote address. */
+  private _startups = new Map<string, number>();
+  private _startupCount = 0;
   private _closed = false;
   /** Ends the pause before the next accept, while there is one. */
   private _wakeAccept?: () => void;
@@ -1823,6 +1862,28 @@ export class Server extends EventEmitter<ServerEvents> {
       return;
     }
 
+    const source = transport.remoteAddress ?? '';
+    const fromSource = this._startups.get(source) ?? 0;
+    if (
+      this._startupCount >= (this._config.maxStartups ?? DEFAULT_MAX_STARTUPS) ||
+      fromSource >= (this._config.perSourceMaxStartups ?? DEFAULT_PER_SOURCE_MAX_STARTUPS)
+    ) {
+      this._config.debug?.(`Refusing ${source}: too many connections not yet authenticated`);
+      transport.close();
+      return;
+    }
+    this._startupCount++;
+    this._startups.set(source, fromSource + 1);
+    let starting = true;
+    const started = () => {
+      if (!starting) return;
+      starting = false;
+      this._startupCount--;
+      const left = this._startups.get(source)! - 1;
+      if (left > 0) this._startups.set(source, left);
+      else this._startups.delete(source);
+    };
+
     let debug = this._config.debug;
     if (debug) {
       const debugPrefix = `[${Date.now()}] `;
@@ -1842,13 +1903,16 @@ export class Server extends EventEmitter<ServerEvents> {
         this._config,
       );
     } catch (err) {
+      started();
       transport.close();
       this.emit('error', err as Error);
       return;
     }
 
     this._connections++;
+    connection.on('ready', started);
     connection.on('close', () => {
+      started();
       this._connections--;
     });
   }
