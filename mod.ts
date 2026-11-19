@@ -73,7 +73,7 @@ export type {
 } from './src/protocol/constants.ts';
 
 // ─── SFTP ─────────────────────────────────────────────────────────────────────
-export { SFTP } from './src/protocol/sftp/SFTP.ts';
+export { MAX_SERVER_BUFFERED, SFTP } from './src/protocol/sftp/SFTP.ts';
 export type { SFTPClient } from './src/protocol/sftp/SFTP.ts';
 export type { SFTPConfig } from './src/protocol/sftp/types.ts';
 export { OPEN_MODE, STATUS_CODE, STATUS_CODE_STR } from './src/protocol/sftp/constants.ts';

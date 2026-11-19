@@ -117,6 +117,14 @@ function payloadParts(
 }
 
 /**
+ * The most a server holds of responses its client's window has not let out
+ * yet. A client that sends requests and never reads their responses is cut
+ * off here rather than have the server hold them all; a server that waits for
+ * 'drain' when `bufferedAmount` grows never comes near it.
+ */
+export const MAX_SERVER_BUFFERED = 64 * 1024 * 1024;
+
+/**
  * Client interface for SFTP
  */
 export interface SFTPClient {
@@ -185,6 +193,8 @@ export class SFTP extends EventEmitter {
   // @ts-ignore Used for flow control
   private _chunkcb?: () => void;
   private _buffer: OutboundPayload[] = [];
+  /** The bytes in `_buffer` not sent yet */
+  private _buffered = 0;
   private _removeWindowAdjustListener?: () => void;
 
   // Parser instance
@@ -223,6 +233,14 @@ export class SFTP extends EventEmitter {
         this._drainBuffer();
       }
     });
+  }
+
+  /**
+   * The bytes of packets the remote's window has not let out yet. 'drain' is
+   * emitted when they have all gone out.
+   */
+  get bufferedAmount(): number {
+    return this._buffered;
   }
 
   /**
@@ -1464,6 +1482,12 @@ export class SFTP extends EventEmitter {
     const ret = this._tryWritePayload(payload);
     if (ret !== undefined) {
       this._buffer.push(ret);
+      this._buffered += ret.length - ret.offset;
+      if (this.server && this._buffered > MAX_SERVER_BUFFERED) {
+        this._buffer = [];
+        this._buffered = 0;
+        this._doFatalError('Outbound: client does not read its responses');
+      }
       return false;
     }
     return true;
@@ -1521,7 +1545,9 @@ export class SFTP extends EventEmitter {
     while (i < buffer.length) {
       const payload = buffer[i];
       const ret = this._tryWritePayload(payload);
+      this._buffered -= payload.length - payload.offset;
       if (ret !== undefined) {
+        this._buffered += ret.length - ret.offset;
         if (ret !== payload) buffer[i] = ret;
         if (i > 0) this._buffer = buffer.slice(i);
         return;
@@ -1529,7 +1555,11 @@ export class SFTP extends EventEmitter {
       ++i;
     }
 
-    if (i > 0) this._buffer = [];
+    if (i > 0) {
+      this._buffer = [];
+      this._buffered = 0;
+      this.emit('drain');
+    }
   }
 
   private _doFatalError(msg: string): void {

@@ -889,6 +889,13 @@ export class Connection extends EventEmitter<ConnectionEvents> {
       }
 
       const chan = channel as unknown as Channel;
+      // The window is what the client may send before it is told it can send more; data
+      // past it would have to be held without bound, so the client is cut off.
+      if (data.length > chan.incoming.window) {
+        this._protocol.disconnect(DISCONNECT_REASON.PROTOCOL_ERROR);
+        transport.close();
+        return;
+      }
       chan.pushData(data);
     };
 

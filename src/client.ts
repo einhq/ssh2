@@ -739,6 +739,13 @@ export class Client extends EventEmitter<ClientEvents> {
       }
     };
 
+    // The window is what the server may send before it is told it can send more; data past
+    // it would have to be held without bound, so the server is cut off.
+    const overrun = () => {
+      this._protocol?.disconnect(DISCONNECT_REASON.PROTOCOL_ERROR);
+      this._transport?.close();
+    };
+
     handlers.CHANNEL_DATA = (_p, recipient, data) => {
       const channel = this._chanMgr.get(recipient);
       if (typeof channel !== 'object' || channel === null) return;
@@ -747,6 +754,7 @@ export class Client extends EventEmitter<ClientEvents> {
       // deno-lint-ignore no-explicit-any
       const obj = channel as any;
       if (typeof obj.push === 'function' && obj.type === 'sftp') {
+        if (data.length > obj.incoming.window) return overrun();
         // SFTP parses synchronously, so its window is replenished as it arrives
         obj.incoming.window -= data.length;
         if (obj.incoming.window <= WINDOW_THRESHOLD) {
@@ -759,7 +767,7 @@ export class Client extends EventEmitter<ClientEvents> {
       }
 
       const chan = channel as Channel;
-      if (chan.incoming.window === 0) return;
+      if (data.length > chan.incoming.window) return overrun();
 
       chan.pushData(data);
     };
@@ -771,7 +779,7 @@ export class Client extends EventEmitter<ClientEvents> {
       if (typeof channel !== 'object' || channel === null) return;
 
       const chan = channel as Channel;
-      if (chan.incoming.window === 0) return;
+      if (data.length > chan.incoming.window) return overrun();
 
       chan.pushData(data, true);
     };
