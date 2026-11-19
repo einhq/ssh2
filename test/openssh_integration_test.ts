@@ -125,10 +125,12 @@ async function createTestServer(options: {
   hostKey: Awaited<ReturnType<typeof generateTestHostKeyEd25519>>;
   acceptPassword?: string;
   cipherList?: string[];
+  ident?: string;
 }): Promise<{ server: Server; port: number; close: () => void }> {
-  const { hostKey, acceptPassword = 'testpass', cipherList } = options;
+  const { hostKey, acceptPassword = 'testpass', cipherList, ident } = options;
 
   const server = new Server({
+    ident,
     hostKeys: [hostKey.parsedKey],
     algorithms: cipherList
       ? {
@@ -166,6 +168,17 @@ async function createTestServer(options: {
             (stream.stderr as StderrWritable).write('done\n');
             stream.exit(3);
             stream.end();
+            return;
+          }
+          // `endless`: a chunk every 10 ms until the client says it can write no more (`eow`), then 141
+          if (info.command === 'endless') {
+            const timer = setInterval(() => stream.write(largeOutput(65536)[0]), 10);
+            stream.on('eow', () => {
+              clearInterval(timer);
+              stream.exit(141);
+              stream.end();
+            });
+            stream.on('close', () => clearInterval(timer));
             return;
           }
           // Echo the command back
@@ -833,6 +846,55 @@ Deno.test({
       } finally {
         await testServer.close();
       }
+    }
+  },
+  sanitizeResources: false,
+  sanitizeOps: false,
+});
+
+Deno.test({
+  name: 'integration-openssh: a command learns its client stopped reading (eow@openssh.com)',
+  ignore: !(await checkSshpass()),
+  async fn() {
+    const hostKey = await generateTestHostKeyEd25519();
+    // OpenSSH's client says it can write no more only to a server that calls itself OpenSSH
+    const testServer = await createTestServer({ hostKey, ident: 'OpenSSH_compatible test' });
+
+    try {
+      // `ssh host endless | head -c 1`: the output closes after the first bytes, and ssh, which
+      // keeps the channel open, ends only once the server ends the command.
+      const proc = new Deno.Command('sshpass', {
+        args: [
+          '-p',
+          'testpass',
+          'ssh',
+          '-o',
+          'StrictHostKeyChecking=no',
+          '-o',
+          'UserKnownHostsFile=/dev/null',
+          '-o',
+          'LogLevel=ERROR',
+          '-o',
+          'PreferredAuthentications=password',
+          '-p',
+          testServer.port.toString(),
+          'testuser@localhost',
+          'endless',
+        ],
+        stdin: 'null',
+        stdout: 'piped',
+        stderr: 'null',
+      }).spawn();
+      const timer = setTimeout(() => proc.kill(), 10_000);
+      const reader = proc.stdout.getReader();
+      assertGreater((await reader.read()).value?.length ?? 0, 0);
+      await reader.cancel();
+
+      const { code } = await proc.status;
+      clearTimeout(timer);
+      assertEquals(code, 141);
+    } finally {
+      await testServer.close();
     }
   },
   sanitizeResources: false,

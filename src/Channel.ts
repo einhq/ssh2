@@ -96,6 +96,13 @@ export interface ChannelEvents {
   drain: [];
   'exit-status': [number];
   'exit-signal': [string, boolean, string];
+  /**
+   * Server side: the client can no longer write what it is sent (OpenSSH's `eow@openssh.com`), as
+   * when `ssh host cmd | head` has its output closed. It keeps the channel open until the command
+   * ends, so this is what tells the command to stop, as a write to a closed pipe would. OpenSSH's
+   * client sends it only to a server whose `ident` starts with `OpenSSH`.
+   */
+  eow: [];
 }
 
 /**

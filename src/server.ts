@@ -975,6 +975,13 @@ export class Connection extends EventEmitter<ConnectionEvents> {
         };
       }
 
+      // Sent after the client's EOF, which marks the session ending, and it is about the other
+      // direction: what the command writes has nowhere to go any more.
+      if (type === 'eow@openssh.com') {
+        (session._channel as Channel | undefined)?.emit('eow');
+        return;
+      }
+
       if (session._ending) {
         reject?.();
         return;
