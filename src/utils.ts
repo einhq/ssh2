@@ -93,6 +93,13 @@ export function onChannelClose(
       outgoing: { state: string };
     };
     if (chanInfo.incoming.state === 'closed') return;
+    // The session's exec, shell or subsystem channel shares its state, so it is closed first,
+    // while that state still says open: afterwards it would look closed already and never hear
+    // of it, and whoever runs the command would never learn its client is gone.
+    const subChannel = sessionLike._channel as ChannelOrCallback | undefined;
+    if (subChannel) {
+      onChannelClose(chanMgr, recipient, subChannel, err, dead);
+    }
     chanMgr.remove(recipient);
     chanInfo.incoming.state = 'closed';
     chanInfo.outgoing.state = 'closed';
@@ -102,11 +109,6 @@ export function onChannelClose(
       (sessionLike.emit as (event: string) => void)('end');
     }
     (sessionLike.emit as (event: string) => void)('close');
-    // Also clean up underlying _channel if present
-    const subChannel = sessionLike._channel as ChannelOrCallback | undefined;
-    if (subChannel) {
-      onChannelClose(chanMgr, recipient, subChannel, err, dead);
-    }
     return;
   }
 

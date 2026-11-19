@@ -737,3 +737,37 @@ Deno.test('exec: exec() immediately after connect() without separate ready liste
     verifyMustCallChecks();
   }
 });
+
+Deno.test('exec: the exec channel closes when its client goes without closing it', async () => {
+  clearMustCallChecks();
+  const ctx = await createTestContext('client gone');
+
+  try {
+    const conn = await connectWithPasswordAuth(ctx, 'client gone');
+
+    // Server side: a command that runs until its channel closes, as one whose client was killed
+    const closed = new Promise<void>((resolve) => {
+      conn.on('session', (accept: () => Session | undefined) => {
+        const session = accept();
+        assertExists(session);
+        session!.on('exec', (acceptExec: () => Channel | undefined) => {
+          const stream = acceptExec();
+          assertExists(stream);
+          stream!.write('running\n');
+          stream!.on('close', () => resolve());
+        });
+      });
+    });
+
+    // Client side: read the first output, then disconnect without closing the channel
+    const stream = await ctx.client.exec('run-forever');
+    const reader = stream.stdout.getReader();
+    assertEquals(decoder.decode((await reader.read()).value), 'running\n');
+    reader.releaseLock();
+    ctx.client.end();
+
+    await closed;
+  } finally {
+    await ctx.cleanup();
+  }
+});
